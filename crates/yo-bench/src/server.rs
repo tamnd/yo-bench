@@ -40,6 +40,9 @@ impl Server {
                     .arg("127.0.0.1")
                     .arg("--port")
                     .arg(plan.port.to_string());
+                if let Some(path) = &plan.socket {
+                    cmd.arg("--unixsocket").arg(path);
+                }
             }
             Kind::Redis | Kind::Valkey => {
                 // Persistence off on both sides. We have no file yet, so a
@@ -63,7 +66,21 @@ impl Server {
                     .arg(target.io_threads.to_string())
                     .arg("--dir")
                     .arg(dir);
+                if let Some(path) = &plan.socket {
+                    // The port stays open on every server, socket file run or
+                    // not, because the readiness check, the C1 check and the
+                    // shutdown all go over it. Only the load moves.
+                    cmd.arg("--unixsocket").arg(path);
+                }
             }
+        }
+
+        if let Some(path) = &plan.socket {
+            // A server that was killed rather than asked to stop leaves the
+            // path behind, and Redis refuses to bind one that exists. One
+            // server runs at a time here, so anything at that path is a
+            // leftover from the last case and not somebody else's socket.
+            let _ = std::fs::remove_file(path);
         }
 
         let log = std::fs::File::create(dir.join(format!("{}.log", target.name)))?;

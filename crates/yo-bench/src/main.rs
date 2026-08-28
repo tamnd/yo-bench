@@ -48,6 +48,7 @@ options:
   --value-bytes N   value size
   --io-threads N    io threads given to Redis and Valkey
   --pin SRV,LOAD    cpu lists for the server and the generator, for the confound run
+  --socket PATH     run the load over a socket file instead of over loopback TCP
   --out DIR         where to write the report, results/ by default
   --quiet           only print the table at the end
 
@@ -82,6 +83,7 @@ struct Opts {
     value_bytes: Option<u32>,
     io_threads: Option<u32>,
     pin: Option<(String, String)>,
+    socket: Option<String>,
     out: PathBuf,
     quiet: bool,
 }
@@ -127,6 +129,10 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     }
     if !opts.pipelines.is_empty() {
         plan.cases.retain(|c| opts.pipelines.contains(&c.pipeline));
+    }
+    if let Some(path) = &opts.socket {
+        plan.socket = Some(path.clone());
+        plan.name = format!("{}-socket", plan.name);
     }
     if let Some((srv, load)) = &opts.pin {
         plan.server_cpus = Some(srv.clone());
@@ -485,6 +491,7 @@ fn parse(args: &[String]) -> Result<Option<Opts>, String> {
         value_bytes: None,
         io_threads: None,
         pin: None,
+        socket: None,
         out: PathBuf::from("results"),
         quiet: false,
     };
@@ -508,6 +515,7 @@ fn parse(args: &[String]) -> Result<Option<Opts>, String> {
             "--yodb" => o.yodb = Some(PathBuf::from(value()?)),
             "--out" => o.out = PathBuf::from(value()?),
             "--only" => o.only.push(value()?),
+            "--socket" => o.socket = Some(value()?),
             "--requests" => o.requests = Some(number(&value()?, arg)?),
             "--clients" => o.clients = Some(number(&value()?, arg)?),
             "--threads" => o.threads = Some(number(&value()?, arg)?),

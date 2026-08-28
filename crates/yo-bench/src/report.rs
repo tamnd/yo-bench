@@ -317,6 +317,21 @@ impl Report {
             "{} connections over {} generator threads, {} commands per measured run, {} byte values, {} keys, best of {}.\n",
             p.clients, p.threads, p.requests, p.value_bytes, p.keyspace, p.repeats
         );
+        // The transport, said once and said plainly, because two reports that
+        // differ only in this look identical at a glance and are not
+        // comparable row for row.
+        match &p.socket {
+            Some(path) => {
+                let _ = writeln!(
+                    s,
+                    "The load runs over the socket file {path}. Every server also listens on port {}, which is where the readiness check and the confound checks go, but no measured command went over it.\n",
+                    p.port
+                );
+            }
+            None => {
+                let _ = writeln!(s, "The load runs over loopback TCP on port {}.\n", p.port);
+            }
+        }
 
         let _ = writeln!(s, "## Under test\n");
         for t in &p.targets {
@@ -538,6 +553,14 @@ impl Report {
         let _ = writeln!(s, "  \"requests\": {},", self.plan.requests);
         let _ = writeln!(s, "  \"value_bytes\": {},", self.plan.value_bytes);
         let _ = writeln!(s, "  \"keyspace\": {},", self.plan.keyspace);
+        let _ = writeln!(
+            s,
+            "  \"transport\": \"{}\",",
+            match &self.plan.socket {
+                Some(path) => format!("unix:{}", esc(path)),
+                None => "tcp".to_string(),
+            }
+        );
         // The bar the wire rows were judged against, so a reader of the JSON
         // does not have to rederive it from the PING rows.
         s.push_str("  \"ceiling\": [");
