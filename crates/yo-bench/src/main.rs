@@ -9,6 +9,7 @@
 //! Run it on the box under test, not across a network from it, unless the
 //! number you want is a number about your network.
 
+mod confound;
 mod load;
 mod machine;
 mod plan;
@@ -145,6 +146,10 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     eprintln!("{}", machine.summary());
     eprintln!("writing to {}\n", dir.display());
 
+    // Before anything is started, because a plan that cannot produce an honest
+    // number should cost a second and not an hour.
+    confound::before_the_run(&plan)?;
+
     preflight(&mut plan, &dir)?;
     let rows = measure(&plan, &dir, opts.quiet)?;
     let report = Report {
@@ -212,6 +217,10 @@ fn preflight(plan: &mut Plan, dir: &std::path::Path) -> Result<(), String> {
 fn check(plan: &Plan, target: &plan::Target, dir: &std::path::Path) -> Result<(), String> {
     let srv = Server::start(target, plan, dir)
         .map_err(|e| format!("{} would not start: {e}", target.name))?;
+    if let Err(e) = confound::against(&srv, &target.name, plan) {
+        srv.stop();
+        return Err(e);
+    }
     let mut out = Ok(());
     for case in &plan.cases {
         out = load::run(case.driver, case.op, plan, case.pipeline, 2000, true)
@@ -320,6 +329,14 @@ fn measure(plan: &Plan, dir: &std::path::Path, quiet: bool) -> Result<Vec<Row>, 
 
             let mut srv = Server::start(target, plan, dir)
                 .map_err(|e| format!("{} would not start: {e}", target.name))?;
+            // Every server, before every run, which is what the registry says.
+            // Once per session would miss a rival that was made a replica
+            // halfway through, and a check that only runs when nothing has
+            // changed is a check that never fires.
+            if let Err(e) = confound::against(&srv, &target.name, plan) {
+                srv.stop();
+                return Err(e);
+            }
 
             // A read case needs something to read. Everything else builds its
             // own keys as it goes.
