@@ -1,0 +1,22 @@
+[package]
+name = "yo-bench"
+description = "Runs the public benchmark suites against yo, Redis and Valkey and reports the ratio."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# No dependencies, on purpose. This binary starts processes, reads their output
+# and writes a table. Everything it needs is in std, and a benchmark harness
+# that cannot be built on the box under test because a crate in its tree stopped
+# compiling is a benchmark harness that produces no numbers.
+[dependencies]
+
+[[bin]]
+name = "yobench"
+path = "src/main.rs"

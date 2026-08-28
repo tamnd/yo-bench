@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/yo-bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tamnd/yo-bench"
+homepage = "https://yo.tamnd.dev"
+authors = ["tamnd <tamnd87@gmail.com>"]
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+alloc_instead_of_core = "warn"
+
+# The harness is not on the measured path, it starts processes and reads their
+# output, so this profile is about a fast build and a readable panic rather than
+# about speed. The thing being measured is built by the yo repository's own
+# release profile and that is the number that gets published.
+[profile.release]
+opt-level = 2
+debug = 1

@@ -1,0 +1,3 @@
+# Measurements are outputs, not source. They go in the report, not in the tree.
+/results/
+/target/
