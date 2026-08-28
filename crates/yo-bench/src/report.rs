@@ -68,12 +68,12 @@ const TICK: f64 = 0.25;
 /// `bench/00` section 4.2. A command sent over a socket cannot be ten times
 /// faster than a correct rival on the same box, because both of them pay for
 /// the same round trip and the round trip is nearly all of it. Measured on the
-/// gate box on 2026-08-29, `PING` at pipeline 1 ran at 147,967 for yo, 158,372
-/// for Redis and 148,110 for Valkey. Three servers with three event loops,
-/// three allocators and two languages, inside seven percent of each other on a
-/// command that does no work. Ten times Redis is 1,583,719, which is ten times
-/// faster than the wire, so the ratio bar was not a hard target on these rows,
-/// it was an unreachable one.
+/// gate box on 2026-08-29, `PING` at pipeline 1 ran between 142,716 and 185,864
+/// across the three servers depending on the server and the hour, on a command
+/// that reads no key and allocates nothing. Ten times Redis on the same day is
+/// about 1.6 million, which is ten times faster than the fastest empty round
+/// trip the box has ever done, so the ratio bar was not a hard target on these
+/// rows, it was an unreachable one.
 ///
 /// So a wire row is scored against the ceiling instead, the same way `bench/00`
 /// section 4.1 already scores a bandwidth bound command against `memcpy`. The
@@ -83,14 +83,21 @@ const TICK: f64 = 0.25;
 /// here rather than picked again.
 const CEILING_SHARE: f64 = 0.85;
 
-/// How far apart the servers' `PING` numbers can be and still be a ceiling.
+/// How far apart the servers' `PING` numbers can be before the report says so.
 ///
-/// The claim that a number is the box's and not a server's rests on unrelated
-/// servers agreeing about it. If they stop agreeing, one of them is doing
-/// something the others are not and the row is a result again, so the ratio
-/// bar applies to it. Fifteen percent is loose enough to absorb the run to run
-/// spread this rig sees on a busy box and tight enough that a real difference
-/// in the network path shows up as one.
+/// Not a gate. The ceiling is the fastest `PING` anyone managed either way,
+/// because that is the hardest available bar and because a number that one
+/// server demonstrated is a number the box can do. The spread is reported
+/// because it says what kind of ceiling it is: servers within a few percent of
+/// each other means the number belongs to the box and the transport, and
+/// servers far apart means one of them has a wire path the others do not and
+/// the bar is that one's number.
+///
+/// Both have been seen on the gate box within a day. The first measurement had
+/// yo at 147,967, Redis at 158,372 and Valkey at 148,110 at pipeline 1, which
+/// is seven percent. The first full run with the ceiling pass in it had yo at
+/// 185,864, Redis at 159,850 and Valkey at 142,716 on the same generator and
+/// depth, which is thirty percent with ours on top.
 const CEILING_AGREEMENT: f64 = 0.15;
 
 /// A key that identifies a case across targets.
@@ -124,9 +131,8 @@ pub struct Verdict {
     pub unresolved: bool,
     /// The fastest `PING` any server managed on this generator and depth.
     ///
-    /// `None` when the plan did not measure one, or when the servers did not
-    /// agree closely enough for it to be called a ceiling, in which case this
-    /// row falls back to the ratio bar.
+    /// `None` only when the plan did not measure one, in which case this row
+    /// falls back to the ratio bar.
     pub ceiling: Option<f64>,
 }
 
@@ -187,28 +193,55 @@ pub struct Report {
 impl Report {
     /// The fastest `PING` any server managed, per generator and pipeline depth.
     ///
-    /// `None` for a depth the plan did not measure a `PING` at, and `None` when
-    /// the servers were more than [`CEILING_AGREEMENT`] apart on it, because
-    /// then it is not a fact about the box. Both cases send the row back to the
-    /// ratio bar rather than silently passing it.
+    /// The fastest and not the average, because the bar has to be the hardest
+    /// one the evidence supports. If a rival answered an empty command faster
+    /// than we did, the box can do that and our number is short of what the box
+    /// can do. If we answered fastest, our own `PING` is still a bound on every
+    /// other row we run, since `PING` is the same server doing strictly less
+    /// work. Either way the fastest of them is the number to beat.
+    ///
+    /// `None` only when nothing measured a `PING` on that generator and depth,
+    /// which sends those rows back to the ratio bar.
     pub fn ceiling(&self, driver: Driver, pipeline: u32) -> Option<f64> {
+        self.rows
+            .iter()
+            .filter(|r| r.op == Op::Ping && r.driver == driver && r.pipeline == pipeline)
+            .map(|r| r.ops)
+            .fold(None, |best: Option<f64>, ops| {
+                Some(best.map_or(ops, |b| b.max(ops)))
+            })
+            .filter(|c| *c > 0.0)
+    }
+
+    /// How far apart the servers were on `PING`, as a share of the fastest.
+    ///
+    /// `None` when fewer than two servers were measured, because one server
+    /// agrees with itself and that is not evidence of anything.
+    pub fn ceiling_spread(&self, driver: Driver, pipeline: u32) -> Option<f64> {
         let pings: Vec<f64> = self
             .rows
             .iter()
             .filter(|r| r.op == Op::Ping && r.driver == driver && r.pipeline == pipeline)
             .map(|r| r.ops)
             .collect();
-        // Two at the least, because one server agreeing with itself is not
-        // evidence of anything.
         if pings.len() < 2 {
             return None;
         }
         let hi = pings.iter().copied().fold(f64::MIN, f64::max);
         let lo = pings.iter().copied().fold(f64::MAX, f64::min);
-        if hi <= 0.0 || (hi - lo) / hi > CEILING_AGREEMENT {
+        if hi <= 0.0 {
             return None;
         }
-        Some(hi)
+        Some((hi - lo) / hi)
+    }
+
+    /// Which server set the ceiling on this generator and depth.
+    fn ceiling_holder(&self, driver: Driver, pipeline: u32) -> Option<String> {
+        self.rows
+            .iter()
+            .filter(|r| r.op == Op::Ping && r.driver == driver && r.pipeline == pipeline)
+            .max_by(|a, b| a.ops.total_cmp(&b.ops))
+            .map(|r| r.target.clone())
     }
 
     /// One verdict per case, in plan order.
@@ -427,8 +460,7 @@ impl Report {
         let _ = writeln!(s, "## The ceiling\n");
         let _ = writeln!(
             s,
-            "PING reads no key, allocates nothing and frames a four byte reply, so whatever it runs at is the fastest anything can answer a client on this box over this transport. It is measured here for every server under test, not just ours, because the point of the number is that it belongs to the box and not to a server. Three unrelated servers landing within a few percent of each other is the evidence for that. If they come apart by more than {:.0} percent the number is not a ceiling, this report says so, and the rows fall back to being scored against the rivals.\n",
-            CEILING_AGREEMENT * 100.0
+            "PING reads no key, allocates nothing and frames a four byte reply, so whatever it runs at is the fastest anything can answer a client on this box over this transport. It is measured for every server under test and not just for ours, and the ceiling is the fastest of them. The fastest and not the average, because a number one server demonstrated is a number the box can do, and because our own PING bounds every other row we run whatever the rivals did, PING being the same server doing strictly less work.\n"
         );
         let _ = writeln!(s, "| generator | pipeline | server | ops/sec |");
         let _ = writeln!(s, "| --- | --- | --- | --- |");
@@ -451,19 +483,36 @@ impl Report {
             }
         }
         for (driver, pipeline) in seen {
-            match self.ceiling(driver, pipeline) {
-                Some(c) => {
+            let Some(c) = self.ceiling(driver, pipeline) else {
+                continue;
+            };
+            let holder = self.ceiling_holder(driver, pipeline).unwrap_or_default();
+            let _ = writeln!(
+                s,
+                "The {driver} ceiling at pipeline {pipeline} is {} per second, set by {holder}, so a row on that generator and depth passes at {}.",
+                thousands(c),
+                thousands(c * CEILING_SHARE)
+            );
+            match self.ceiling_spread(driver, pipeline) {
+                Some(spread) if spread > CEILING_AGREEMENT => {
                     let _ = writeln!(
                         s,
-                        "The {driver} ceiling at pipeline {pipeline} is {} per second, so a row on that generator and depth passes at {}.",
-                        thousands(c),
-                        thousands(c * CEILING_SHARE)
+                        "The servers are {:.0} percent apart there, which is more than the {:.0} percent that would say the number belongs to the box rather than to a server. It is {holder}'s wire path that set it, and every row on that generator and depth is held to it.",
+                        spread * 100.0,
+                        CEILING_AGREEMENT * 100.0
+                    );
+                }
+                Some(spread) => {
+                    let _ = writeln!(
+                        s,
+                        "The servers are within {:.0} percent of each other there, which is the evidence that the number is the box and the transport rather than any one of them.",
+                        spread * 100.0
                     );
                 }
                 None => {
                     let _ = writeln!(
                         s,
-                        "The servers did not agree on PING under {driver} at pipeline {pipeline}, so there is no ceiling at that generator and depth and those rows are scored against the rivals."
+                        "Only one server was measured there, so the number is ours and not the box's, and it still bounds every other row on that generator and depth."
                     );
                 }
             }
@@ -752,9 +801,9 @@ mod tests {
         ]
     }
 
-    /// Three servers inside seven percent is a fact about the box.
+    /// The ceiling is the fastest empty round trip anybody managed.
     #[test]
-    fn a_ceiling_is_the_fastest_of_servers_that_agree() {
+    fn a_ceiling_is_the_fastest_ping_anyone_managed() {
         let r = with_ceiling(
             report(vec![
                 row("yo", Kind::Yo, 140_000.0, 10_000),
@@ -764,8 +813,12 @@ mod tests {
         );
         let c = r
             .ceiling(Driver::RedisBenchmark, 1)
-            .expect("seven percent apart is a ceiling");
-        assert!((c - 158_372.0).abs() < 1e-9);
+            .expect("three PING rows were measured");
+        assert!((c - 158_372.0).abs() < 1e-9, "Redis was fastest that hour");
+        let spread = r
+            .ceiling_spread(Driver::RedisBenchmark, 1)
+            .expect("three rows");
+        assert!(spread < CEILING_AGREEMENT, "{spread}");
     }
 
     /// A row at nine tenths of the wire is a pass at 1.08x the rival.
@@ -814,30 +867,44 @@ mod tests {
         assert!(!r.verdicts()[0].passes());
     }
 
-    /// If the servers stop agreeing, the number was never a ceiling.
+    /// Our own PING bounds our own rows, whatever the rivals did.
+    ///
+    /// These are the numbers from the first full run with the ceiling pass in
+    /// it, where ours came out fastest by thirty percent. The bar is then our
+    /// own empty round trip, which is the right answer: a GET cannot be faster
+    /// than the same server answering PING, because PING is that server doing
+    /// strictly less.
     #[test]
-    fn servers_far_apart_on_ping_do_not_make_a_ceiling() {
+    fn the_fastest_server_sets_the_bar_even_when_it_is_ours() {
         let pings = vec![
-            ping("yo", Kind::Yo, 300_000.0),
-            ping("redis", Kind::Redis, 158_372.0),
-            ping("valkey", Kind::Valkey, 148_110.0),
+            ping("yo", Kind::Yo, 185_864.0),
+            ping("redis", Kind::Redis, 159_850.0),
+            ping("valkey", Kind::Valkey, 142_716.0),
         ];
         let r = with_ceiling(
             report(vec![
-                row("yo", Kind::Yo, 140_000.0, 10_000),
-                row("redis", Kind::Redis, 130_000.0, 40_000),
+                row("yo", Kind::Yo, 150_000.0, 10_000),
+                row("redis", Kind::Redis, 140_000.0, 40_000),
             ]),
             pings,
         );
-        assert!(r.ceiling(Driver::RedisBenchmark, 1).is_none());
-        let v = r.verdicts();
-        assert!(v[0].ceiling.is_none());
-        assert!(!v[0].passes(), "back to the ratio bar, and 1.08x fails it");
+        let c = r
+            .ceiling(Driver::RedisBenchmark, 1)
+            .expect("ours is a ceiling too");
+        assert!((c - 185_864.0).abs() < 1e-9);
+        let spread = r
+            .ceiling_spread(Driver::RedisBenchmark, 1)
+            .expect("three rows");
+        assert!(spread > CEILING_AGREEMENT, "thirty percent apart: {spread}");
+        assert!(
+            !r.verdicts()[0].passes(),
+            "81 percent of our own PING is not 85"
+        );
     }
 
-    /// One server agreeing with itself is not evidence of anything.
+    /// One server alone still bounds itself, and the report says it is alone.
     #[test]
-    fn one_server_alone_is_not_a_ceiling() {
+    fn one_server_alone_is_still_a_bound_on_that_server() {
         let r = with_ceiling(
             report(vec![
                 row("yo", Kind::Yo, 140_000.0, 10_000),
@@ -845,7 +912,15 @@ mod tests {
             ]),
             vec![ping("yo", Kind::Yo, 147_967.0)],
         );
-        assert!(r.ceiling(Driver::RedisBenchmark, 1).is_none());
+        let c = r
+            .ceiling(Driver::RedisBenchmark, 1)
+            .expect("ours was measured");
+        assert!((c - 147_967.0).abs() < 1e-9);
+        assert!(
+            r.ceiling_spread(Driver::RedisBenchmark, 1).is_none(),
+            "one server agreeing with itself is not a spread"
+        );
+        assert!(r.verdicts()[0].passes(), "95 percent of our own PING");
     }
 
     /// A ceiling is per generator and per depth, not one number for the run.
