@@ -11,7 +11,12 @@
 # Everything lands under $PREFIX, nothing touches the system paths, and nothing
 # here needs to run twice. A build that is already there is left alone.
 #
-# Usage: suite/provision.sh [--force]
+# It also takes the distribution's own Redis and Valkey off the box. Leaving
+# them installed means a stray `redis-server` on PATH, a system unit holding
+# port 6379, and a real chance of measuring the wrong binary and publishing it.
+# Pass --keep-packages to leave them alone.
+#
+# Usage: suite/provision.sh [--force] [--keep-packages]
 
 set -eu
 
@@ -22,9 +27,11 @@ MEMTIER_VERSION="${MEMTIER_VERSION:-2.5.1}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 
 FORCE=no
+PURGE=yes
 for arg in "$@"; do
   case "$arg" in
     --force) FORCE=yes ;;
+    --keep-packages) PURGE=no ;;
     *) echo "provision: no such option: $arg" >&2; exit 2 ;;
   esac
 done
@@ -67,6 +74,28 @@ if command -v apt-get >/dev/null 2>&1; then
       build-essential pkg-config ca-certificates curl git \
       autoconf automake libtool \
       libssl-dev zlib1g-dev libevent-dev libpcre3-dev >/dev/null
+fi
+
+# ------------------------------------------------------- the packaged rivals
+
+# Off the box. The point of this script is that the thing being measured is the
+# thing that was built here, and the surest way to break that is to leave a
+# second `redis-server` on PATH and a system unit already holding 6379. The
+# builds under $PREFIX carry their version in the file name for the same reason.
+if [ "$PURGE" = yes ] && command -v apt-get >/dev/null 2>&1; then
+  say "removing packaged redis and valkey"
+  for unit in redis-server redis valkey-server valkey; do
+    systemctl stop "$unit" >/dev/null 2>&1 || true
+    systemctl disable "$unit" >/dev/null 2>&1 || true
+  done
+  apt-get purge -y -qq \
+    'redis*' 'valkey*' >/dev/null 2>&1 || true
+  apt-get autoremove -y -qq >/dev/null 2>&1 || true
+  for stale in redis-server redis-cli redis-benchmark valkey-server valkey-cli; do
+    if [ -e "/usr/bin/$stale" ]; then
+      echo "provision: /usr/bin/$stale survived the purge" >&2
+    fi
+  done
 fi
 
 # ---------------------------------------------------------------------- redis
