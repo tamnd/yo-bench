@@ -22,6 +22,17 @@ pub struct Sample {
     pub p50_us: f64,
     /// Ninety ninth percentile round trip in microseconds.
     pub p99_us: f64,
+    /// How long the generator process ran, on our clock and not on its.
+    ///
+    /// Taken here because the generators do not agree about elapsed time and
+    /// one of them cannot be trusted about it: `redis-benchmark` stops on a 250
+    /// millisecond tick and divides by what the clock said there, so its idea
+    /// of how long a run took is rounded up to a multiple of a quarter second.
+    /// This is a wall clock around the whole process, so it includes the
+    /// generator's own startup and is an overestimate by a few milliseconds,
+    /// which is the harmless direction for deciding whether a run was long
+    /// enough to mean anything.
+    pub seconds: f64,
     /// The command line, for the report.
     pub cmdline: String,
 }
@@ -58,7 +69,9 @@ pub fn run(
         eprintln!("    {cmdline}");
     }
 
+    let began = std::time::Instant::now();
     let out = cmd.output()?;
+    let seconds = began.elapsed().as_secs_f64();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     if !out.status.success() {
@@ -75,6 +88,7 @@ pub fn run(
     }
     .map_err(|e| io::Error::other(format!("{prog}: {e}\n--- output ---\n{stdout}\n{stderr}")))?;
     sample.cmdline = cmdline;
+    sample.seconds = seconds;
     Ok(sample)
 }
 
@@ -214,6 +228,7 @@ fn parse_redis_benchmark(out: &str, op: Op) -> Result<Sample, String> {
             ops: num(1)?,
             p50_us: num(4)? * 1000.0,
             p99_us: num(6)? * 1000.0,
+            seconds: 0.0,
             cmdline: String::new(),
         });
     }
@@ -248,6 +263,7 @@ fn parse_memtier(out: &str) -> Result<Sample, String> {
             ops: num(1)?,
             p50_us: num(5)? * 1000.0,
             p99_us: num(6)? * 1000.0,
+            seconds: 0.0,
             cmdline: String::new(),
         });
     }
