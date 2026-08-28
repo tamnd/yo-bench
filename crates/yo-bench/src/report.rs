@@ -100,6 +100,15 @@ const CEILING_SHARE: f64 = 0.85;
 /// depth, which is thirty percent with ours on top.
 const CEILING_AGREEMENT: f64 = 0.15;
 
+/// Per command cost with the transport subtracted, in nanoseconds.
+fn work_ns(ops: f64, ping: Option<f64>) -> Option<f64> {
+    let ping = ping?;
+    if ops <= 0.0 || ping <= 0.0 || ops >= ping {
+        return None;
+    }
+    Some(1e9 / ops - 1e9 / ping)
+}
+
 /// A key that identifies a case across targets.
 type Key = (String, String, u32);
 
@@ -134,6 +143,10 @@ pub struct Verdict {
     /// `None` only when the plan did not measure one, in which case this row
     /// falls back to the ratio bar.
     pub ceiling: Option<f64>,
+    /// What our own server answered `PING` at on this generator and depth.
+    pub our_ping: Option<f64>,
+    /// What the rival on this row answered `PING` at.
+    pub rival_ping: Option<f64>,
 }
 
 impl Verdict {
@@ -166,6 +179,46 @@ impl Verdict {
     /// How much of the ceiling this row reached, if there is one.
     pub fn share(&self) -> Option<f64> {
         self.ceiling.filter(|c| *c > 0.0).map(|c| self.ours / c)
+    }
+
+    /// What the command itself cost us, in nanoseconds, with the transport
+    /// taken out.
+    ///
+    /// A row runs at some number of commands a second and `PING` on the same
+    /// server, generator and depth runs at another. `PING` reads no key,
+    /// allocates nothing and frames four bytes, so the difference between the
+    /// two per command times is what this server spent on the command and not
+    /// on getting it off the wire and the answer back onto it.
+    ///
+    /// This is context and not a bar. At depth 1 the transport is most of the
+    /// time and this number is small and noisy. At depth 16 the transport is
+    /// amortised over sixteen commands and this is most of what is left, which
+    /// is why a depth 16 row can be well clear of every rival and still sit at
+    /// sixty percent of the ceiling: the ceiling is not doing the work.
+    ///
+    /// `None` when there is no `PING` to subtract, or when the row came out
+    /// faster than `PING` did, which is measurement noise rather than a command
+    /// that costs less than nothing.
+    pub fn our_work_ns(&self) -> Option<f64> {
+        work_ns(self.ours, self.our_ping)
+    }
+
+    /// The same number for the rival this row is compared against.
+    pub fn rival_work_ns(&self) -> Option<f64> {
+        work_ns(self.best_rival, self.rival_ping)
+    }
+
+    /// How many times cheaper the command is on our side, transport removed.
+    ///
+    /// Above one means we spend less per command than the rival does. This is
+    /// the closest thing the wire has to the in process number, and it is
+    /// reported rather than gated, because what a client actually gets is the
+    /// throughput column and not this one.
+    pub fn work_ratio(&self) -> Option<f64> {
+        match (self.our_work_ns(), self.rival_work_ns()) {
+            (Some(ours), Some(theirs)) if ours > 0.0 => Some(theirs / ours),
+            _ => None,
+        }
     }
 
     /// What the verdict column says.
@@ -235,6 +288,25 @@ impl Report {
         Some((hi - lo) / hi)
     }
 
+    /// What one named server answered `PING` at, on this generator and depth.
+    ///
+    /// The ceiling is the fastest of these and is what rows are scored against.
+    /// This is a different question: it is the transport cost for that one
+    /// server, and subtracting it from that same server's real rows leaves the
+    /// cost of the command itself.
+    pub fn ping_of(&self, target: &str, driver: Driver, pipeline: u32) -> Option<f64> {
+        self.rows
+            .iter()
+            .find(|r| {
+                r.op == Op::Ping
+                    && r.driver == driver
+                    && r.pipeline == pipeline
+                    && r.target == target
+            })
+            .map(|r| r.ops)
+            .filter(|ops| *ops > 0.0)
+    }
+
     /// Which server set the ceiling on this generator and depth.
     fn ceiling_holder(&self, driver: Driver, pipeline: u32) -> Option<String> {
         self.rows
@@ -300,6 +372,8 @@ impl Report {
                 best_rival_peak_kb: leanest,
                 unresolved,
                 ceiling: self.ceiling(case.driver, case.pipeline),
+                our_ping: self.ping_of(&mine.target, case.driver, case.pipeline),
+                rival_ping: self.ping_of(&best.target, case.driver, case.pipeline),
             });
         }
         out
@@ -384,11 +458,15 @@ impl Report {
         );
         let _ = writeln!(
             s,
-            "| command | generator | pipeline | yo ops/sec | best rival | rival ops/sec | ratio | share | yo peak MiB | rival peak MiB | verdict |"
+            "The two work columns are the same rows with the transport taken out: ours over this row minus ours over our own PING on the same generator and depth, in nanoseconds, and the same subtraction on the rival's side against its own PING. That is what the command cost the server once getting it off the wire is paid for. It is reported and not gated, because what a client gets is the throughput column, but it is the number that says whether a row that missed the ceiling missed it on the engine or on the socket.\n"
         );
         let _ = writeln!(
             s,
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+            "| command | generator | pipeline | yo ops/sec | best rival | rival ops/sec | ratio | share | yo work ns | rival work ns | yo peak MiB | rival peak MiB | verdict |"
+        );
+        let _ = writeln!(
+            s,
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
         );
         let verdicts = self.verdicts();
         for v in &verdicts {
@@ -396,9 +474,13 @@ impl Report {
                 Some(x) => format!("{:.0}%", x * 100.0),
                 None => "-".to_string(),
             };
+            let ns = |x: Option<f64>| match x {
+                Some(x) => format!("{x:.0}"),
+                None => "-".to_string(),
+            };
             let _ = writeln!(
                 s,
-                "| {} | {} | {} | {} | {} | {} | {:.2}x | {} | {:.1} | {:.1} | {} |",
+                "| {} | {} | {} | {} | {} | {} | {:.2}x | {} | {} | {} | {:.1} | {:.1} | {} |",
                 v.case.op,
                 v.case.driver,
                 v.case.pipeline,
@@ -407,6 +489,8 @@ impl Report {
                 thousands(v.best_rival),
                 v.ratio,
                 share,
+                ns(v.our_work_ns()),
+                ns(v.rival_work_ns()),
                 mib(v.our_peak_kb),
                 mib(v.best_rival_peak_kb),
                 v.verdict(),
@@ -444,6 +528,21 @@ impl Report {
                 let _ = writeln!(
                     s,
                     "\n{bound} of them were too close for redis-benchmark to resolve and are not a result for anybody."
+                );
+            }
+            // The same rows read a second way. A run can miss the ceiling on
+            // every depth 16 row and still be spending less per command than
+            // anything else on the box, and a reader who only has the share
+            // column cannot tell that from being slow.
+            let worked: Vec<f64> = verdicts.iter().filter_map(|v| v.work_ratio()).collect();
+            if !worked.is_empty() {
+                let cheaper = worked.iter().filter(|r| **r > 1.0).count();
+                let lo = worked.iter().copied().fold(f64::INFINITY, f64::min);
+                let hi = worked.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let _ = writeln!(
+                    s,
+                    "\nWith the transport subtracted, the command itself is cheaper on our side on {cheaper} of the {} rows where both sides had a PING to subtract, over a range of {lo:.2}x to {hi:.2}x.",
+                    worked.len()
                 );
             }
         }
@@ -822,6 +921,69 @@ mod tests {
             ping("redis", Kind::Redis, 158_372.0),
             ping("valkey", Kind::Valkey, 148_110.0),
         ]
+    }
+
+    /// The work column is this server's row against this server's own PING.
+    ///
+    /// Not against the ceiling. The ceiling belongs to whoever was fastest, and
+    /// subtracting somebody else's transport from our row would put their
+    /// socket in our number.
+    #[test]
+    fn the_work_column_subtracts_each_servers_own_transport() {
+        // Depth 16 numbers off the gate box on 2026-08-29, where the ceiling
+        // and the row are far enough apart for the subtraction to mean
+        // something.
+        let mut yo_get = rb_row("yo", Kind::Yo, 1_988_127.0, 118_000, Driver::RedisBenchmark);
+        yo_get.pipeline = 16;
+        let mut redis_get = rb_row(
+            "redis",
+            Kind::Redis,
+            1_939_650.0,
+            140_000,
+            Driver::RedisBenchmark,
+        );
+        redis_get.pipeline = 16;
+        let mut r = report(vec![yo_get, redis_get]);
+        r.plan.cases[0].pipeline = 16;
+        r.plan.cases.insert(
+            0,
+            Case {
+                op: Op::Ping,
+                driver: Driver::RedisBenchmark,
+                pipeline: 16,
+                requests: N as u64,
+            },
+        );
+        for (target, kind, ops) in [
+            ("yo", Kind::Yo, 2_562_578.0),
+            ("redis", Kind::Redis, 2_648_316.0),
+        ] {
+            let mut p = ping(target, kind, ops);
+            p.pipeline = 16;
+            r.rows.push(p);
+        }
+
+        let v = &r.verdicts()[0];
+        let ours = v.our_work_ns().expect("both rows are there");
+        let theirs = v.rival_work_ns().expect("both rows are there");
+        // 1e9/1988127 - 1e9/2562578 and 1e9/1939650 - 1e9/2648316.
+        assert!((ours - 112.8).abs() < 0.5, "{ours}");
+        assert!((theirs - 138.0).abs() < 0.5, "{theirs}");
+        let ratio = v.work_ratio().expect("both sides");
+        assert!((ratio - 1.22).abs() < 0.01, "{ratio}");
+        // The share on that same row is 75 percent, which is the thing the work
+        // column exists to put in context: a fail on the ceiling and a win on
+        // the command.
+        assert!(!v.passes());
+    }
+
+    /// A row that came out faster than the PING it would be measured against
+    /// has nothing to say about cost, so it says nothing.
+    #[test]
+    fn a_command_never_costs_less_than_nothing() {
+        assert_eq!(work_ns(200_000.0, Some(190_000.0)), None);
+        assert_eq!(work_ns(200_000.0, None), None);
+        assert!(work_ns(150_000.0, Some(200_000.0)).is_some());
     }
 
     /// The ceiling is the fastest empty round trip anybody managed.
