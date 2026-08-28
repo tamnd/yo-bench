@@ -47,6 +47,8 @@ It does not give our server a flag the rivals do not get. If yo needs a tuning f
     --pin 0-3,4-7             server on one set of cores, generator on another
     --yodb path/to/yodb       measure a specific build
 
+Three of the nine confounds in `bench/00` section 5 are checked here before anything is measured, and all three refuse rather than warn. C1 asks every server, ours included, for `INFO replication` after it comes up and stops the run unless it says `role:master` and `connected_slaves:0`, because a rival left as a replica of the subject is doing the subject's writes too. C2 reads the cpu mask back out of the kernel for every server, runs the same `taskset` line the generator runs under and reads that mask back as well, and refuses a layout where the two halves share a core. C3 refuses to run `redis-benchmark` on fewer than four threads, since on one thread it tops out near 470,000 commands a second and turns every pipeline 16 row into a tie at its own ceiling.
+
 The `--io-threads 4` run is a confound check and not the headline. We are one shard on one thread by design, so a run where the rivals get four cores and we get one is a comparison of core counts. It gets its own row and its own column rather than being folded into the ratio.
 
 ## Reading the output

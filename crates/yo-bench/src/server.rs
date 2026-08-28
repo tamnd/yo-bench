@@ -141,6 +141,60 @@ impl Server {
         Ok(())
     }
 
+    /// Send one inline command and read the whole bulk reply back.
+    ///
+    /// Only bulk strings, because the one caller asks for `INFO` and that is
+    /// what it answers. A reply of any other type comes back as an error rather
+    /// than as a prefix of itself, so a check built on this cannot pass by
+    /// reading half of something it did not understand.
+    pub fn ask(&self, line: &str) -> io::Result<String> {
+        let addr = format!("127.0.0.1:{}", self.port);
+        let mut sock = TcpStream::connect(&addr)?;
+        sock.set_read_timeout(Some(Duration::from_secs(5)))?;
+        sock.write_all(line.as_bytes())?;
+        sock.write_all(b"\r\n")?;
+
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        // Read the header first, which is short and ends at the first newline.
+        let len = loop {
+            if let Some(at) = buf.iter().position(|b| *b == b'\n') {
+                let head = String::from_utf8_lossy(&buf[..at]).trim().to_string();
+                let Some(n) = head.strip_prefix('$').and_then(|n| n.parse::<i64>().ok()) else {
+                    return Err(io::Error::other(format!("{line} answered {head:?}")));
+                };
+                if n < 0 {
+                    return Ok(String::new());
+                }
+                buf.drain(..=at);
+                break n as usize;
+            }
+            let n = sock.read(&mut chunk)?;
+            if n == 0 {
+                return Err(io::Error::other(format!("{line} answered nothing")));
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        };
+        while buf.len() < len {
+            let n = sock.read(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let _ = sock.shutdown(Shutdown::Both);
+        buf.truncate(len);
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    /// Which cpus the kernel says this server may run on. Linux only.
+    pub fn affinity(&self) -> Option<String> {
+        let text = std::fs::read_to_string(format!("/proc/{}/status", self.child.id())).ok()?;
+        text.lines()
+            .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+            .map(|v| v.trim().to_string())
+    }
+
     /// Resident set right now, in kibibytes.
     ///
     /// This is the number the memory column is built from, and it is the
