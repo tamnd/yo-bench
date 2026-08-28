@@ -154,13 +154,26 @@ fn memtier_args(op: Op, plan: &Plan, pipeline: u32, requests: u64) -> (String, V
         plan.value_bytes.to_string(),
         "--key-minimum=1".into(),
         format!("--key-maximum={}", plan.keyspace),
-        "--key-pattern=R:R".into(),
         "--hide-histogram".into(),
         "--distinct-client-seed".into(),
     ];
+    // The key pattern goes in the arm and not in the list above, because
+    // memtier takes it under two different names and refuses to be given both.
+    // An arbitrary command has to say `--command-key-pattern`, and passing
+    // `--key-pattern` as well is an error rather than a duplicate: "when using
+    // arbitrary command, key pattern is configured with --command-key-pattern
+    // option", followed by the whole usage message. That killed the gate run
+    // on the first INCR case, an hour into it and after every SET and GET row
+    // had already been measured.
     match op {
-        Op::Set => args.push("--ratio=1:0".into()),
-        Op::Get => args.push("--ratio=0:1".into()),
+        Op::Set => {
+            args.push("--key-pattern=R:R".into());
+            args.push("--ratio=1:0".into());
+        }
+        Op::Get => {
+            args.push("--key-pattern=R:R".into());
+            args.push("--ratio=0:1".into());
+        }
         Op::Incr => {
             args.push("--command=INCR __key__".into());
             args.push("--command-key-pattern=R".into());
