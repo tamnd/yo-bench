@@ -46,6 +46,9 @@ It does not give our server a flag the rivals do not get. If yo needs a tuning f
     --io-threads 4            give Redis and Valkey four io threads, which is the confound row
     --pin 0-3,4-7             server on one set of cores, generator on another
     --yodb path/to/yodb       measure a specific build
+    --socket /tmp/yo.sock     run the load over a socket file instead of loopback TCP
+
+Without `--socket` the load runs over loopback TCP, which is what every published row here is so far. With it, all three servers are started with `--unixsocket` on that path and both generators are pointed at the file, so a socket file run is a full run against the same plan and not a spot check. The port stays open on every server either way, because the readiness check, the C1 confound check and the shutdown all go over it, and the only thing that moves is the measured load. A socket run names itself `gate-socket` so its report lands in its own directory, the report says which transport it used in its header, and the JSON carries it as a `transport` field, since two reports that differ only in this look identical at a glance and are not comparable row for row.
 
 Three of the nine confounds in `bench/00` section 5 are checked here before anything is measured, and all three refuse rather than warn. C1 asks every server, ours included, for `INFO replication` after it comes up and stops the run unless it says `role:master` and `connected_slaves:0`, because a rival left as a replica of the subject is doing the subject's writes too. C2 reads the cpu mask back out of the kernel for every server, runs the same `taskset` line the generator runs under and reads that mask back as well, and refuses a layout where the two halves share a core. C3 refuses to run `redis-benchmark` on fewer than four threads, since on one thread it tops out near 470,000 commands a second and turns every pipeline 16 row into a tie at its own ceiling.
 

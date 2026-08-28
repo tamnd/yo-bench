@@ -202,6 +202,18 @@ pub struct Plan {
     pub warmup: bool,
     /// Port the server under test listens on.
     pub port: u16,
+    /// Socket file the generators talk over, when the run is over one.
+    ///
+    /// `None` is the loopback TCP run, which is what everything before this
+    /// measured and what the published rows are. `Some` points every generator
+    /// at a socket file instead, which takes the IP header, the TCP state
+    /// machine and the checksum out of every round trip and is the cheapest way
+    /// to move the ceiling `bench/00` section 4.2 is about.
+    ///
+    /// Every server still listens on the port as well, so the readiness check,
+    /// the `INFO replication` confound check and the shutdown all keep working
+    /// the same way for all three of them. Only the load moves.
+    pub socket: Option<String>,
     /// Cores for the server, if pinning is on.
     pub server_cpus: Option<String>,
     /// Cores for the generator, if pinning is on.
@@ -265,6 +277,7 @@ impl Plan {
             repeats: 3,
             warmup: true,
             port: 7411,
+            socket: None,
             server_cpus: None,
             load_cpus: None,
             redis_benchmark,

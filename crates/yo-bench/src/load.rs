@@ -118,11 +118,20 @@ fn redis_benchmark_args(
     pipeline: u32,
     requests: u64,
 ) -> (String, Vec<String>) {
-    let args = vec![
-        "-h".into(),
-        "127.0.0.1".into(),
-        "-p".into(),
-        plan.port.to_string(),
+    // `-s` takes a socket file and `-h`/`-p` take a port. Passing both is not
+    // an error and the socket wins, which is exactly the kind of thing that
+    // produces a report labelled one way and measured the other, so only one
+    // of them is ever passed.
+    let mut args = match &plan.socket {
+        Some(path) => vec!["-s".into(), path.clone()],
+        None => vec![
+            "-h".into(),
+            "127.0.0.1".into(),
+            "-p".into(),
+            plan.port.to_string(),
+        ],
+    };
+    args.extend([
         "-t".into(),
         op.bench_name().into(),
         "-n".into(),
@@ -138,7 +147,7 @@ fn redis_benchmark_args(
         "--threads".into(),
         plan.threads.to_string(),
         "--csv".into(),
-    ];
+    ]);
     (plan.redis_benchmark.clone(), args)
 }
 
@@ -150,11 +159,18 @@ fn memtier_args(op: Op, plan: &Plan, pipeline: u32, requests: u64) -> (String, V
     let conns = per_thread * plan.threads;
     let per_conn = (requests / u64::from(conns)).max(1);
 
-    let mut args = vec![
-        "-s".into(),
-        "127.0.0.1".into(),
-        "-p".into(),
-        plan.port.to_string(),
+    // memtier spells it `-S`, and its `-s` is the host. Same rule as above:
+    // one transport per run and never both on the command line.
+    let mut args = match &plan.socket {
+        Some(path) => vec!["-S".into(), path.clone()],
+        None => vec![
+            "-s".into(),
+            "127.0.0.1".into(),
+            "-p".into(),
+            plan.port.to_string(),
+        ],
+    };
+    args.extend([
         "-P".into(),
         "redis".into(),
         "-t".into(),
@@ -170,7 +186,7 @@ fn memtier_args(op: Op, plan: &Plan, pipeline: u32, requests: u64) -> (String, V
         format!("--key-maximum={}", plan.keyspace),
         "--hide-histogram".into(),
         "--distinct-client-seed".into(),
-    ];
+    ]);
     // The key pattern goes in the arm and not in the list above, because
     // memtier takes it under two different names and refuses to be given both.
     // An arbitrary command has to say `--command-key-pattern`, and passing
@@ -313,6 +329,48 @@ mod tests {
         assert!((s.ops - 250_000.50).abs() < 0.01);
         assert!((s.p50_us - 879.0).abs() < 0.01);
         assert!((s.p99_us - 2300.0).abs() < 0.01);
+    }
+
+    /// One transport per command line. Both generators accept a host and a
+    /// socket file at the same time and quietly pick one, so the test that
+    /// matters is not that the right flag is there but that the other one is
+    /// not.
+    #[test]
+    fn a_tcp_run_names_a_host_and_a_port_and_no_socket_file() {
+        let plan = Plan::smoke(Vec::new(), "redis-benchmark".into(), "memtier".into());
+        let (_, rb) = redis_benchmark_args(Op::Get, &plan, 1, 1000);
+        assert!(window(&rb, "-h") == Some("127.0.0.1"));
+        assert!(window(&rb, "-p") == Some(&plan.port.to_string()[..]));
+        assert!(!rb.iter().any(|a| a == "-s"), "{rb:?}");
+
+        let (_, mt) = memtier_args(Op::Get, &plan, 1, 1000);
+        assert!(window(&mt, "-s") == Some("127.0.0.1"));
+        assert!(window(&mt, "-p") == Some(&plan.port.to_string()[..]));
+        assert!(!mt.iter().any(|a| a == "-S"), "{mt:?}");
+    }
+
+    #[test]
+    fn a_socket_run_names_the_file_and_no_host_or_port() {
+        let mut plan = Plan::smoke(Vec::new(), "redis-benchmark".into(), "memtier".into());
+        plan.socket = Some("/tmp/yobench.sock".into());
+
+        let (_, rb) = redis_benchmark_args(Op::Get, &plan, 1, 1000);
+        assert_eq!(window(&rb, "-s"), Some("/tmp/yobench.sock"));
+        assert!(!rb.iter().any(|a| a == "-h" || a == "-p"), "{rb:?}");
+
+        // memtier's `-S` is the socket and its lowercase `-s` is the host, so
+        // this is the one place where the two generators disagree about the
+        // spelling and the wrong letter would still run and still produce a
+        // number, over the wrong transport.
+        let (_, mt) = memtier_args(Op::Get, &plan, 1, 1000);
+        assert_eq!(window(&mt, "-S"), Some("/tmp/yobench.sock"));
+        assert!(!mt.iter().any(|a| a == "-s" || a == "-p"), "{mt:?}");
+    }
+
+    /// The value that follows a flag, or None if the flag is not there.
+    fn window<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        let at = args.iter().position(|a| a == flag)?;
+        args.get(at + 1).map(|s| s.as_str())
     }
 
     #[test]
