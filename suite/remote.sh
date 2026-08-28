@@ -40,31 +40,47 @@ for host in "$@"; do
     continue
   fi
 
+  # Root where we can have it and $HOME where we cannot. A box without
+  # passwordless sudo is still a box worth measuring, it just cannot have its
+  # packages purged or write to /opt, and refusing to provision it would mean
+  # publishing three rows where four were asked for.
+  if ssh "$host" "$via sudo -n true" >/dev/null 2>&1; then
+    sudo="sudo"
+    prefix="$PREFIX"
+  else
+    sudo=""
+    prefix="\$HOME/yo-bench"
+    echo "$host: no passwordless sudo, installing under \$HOME and leaving the packages alone"
+  fi
+
   # The provisioning script goes over the wire rather than being fetched, so a
   # box can be set up from a working copy that has not been pushed yet. `cat`
   # rather than scp because scp cannot reach inside WSL. Everything else comes
   # from git, because the builds are long and a box should be able to redo them
   # without this laptop being awake.
-  ssh "$host" "$via sudo mkdir -p '$PREFIX/suite'"
-  ssh "$host" "$via sudo sh -c 'cat > $PREFIX/suite/provision.sh'" < suite/provision.sh
+  ssh "$host" "$via $sudo sh -c 'mkdir -p $prefix/suite'"
+  ssh "$host" "$via $sudo sh -c 'cat > $prefix/suite/provision.sh'" < suite/provision.sh
 
-  ssh "$host" "$via sudo sh -eu -c '
-    chmod +x $PREFIX/suite/provision.sh
-    $PREFIX/suite/provision.sh
+  keep=""
+  [ -n "$sudo" ] || keep="--keep-packages"
+
+  ssh "$host" "$via $sudo sh -eu -c '
+    chmod +x $prefix/suite/provision.sh
+    PREFIX=$prefix $prefix/suite/provision.sh $keep
 
     export PATH=\$HOME/.cargo/bin:\$PATH
 
-    rm -rf $PREFIX/yo $PREFIX/yo-bench
-    git clone -q $YO_REPO $PREFIX/yo
-    git clone -q $BENCH_REPO $PREFIX/yo-bench
+    rm -rf $prefix/yo $prefix/yo-bench
+    git clone -q $YO_REPO $prefix/yo
+    git clone -q $BENCH_REPO $prefix/yo-bench
 
-    cd $PREFIX/yo && cargo build --release -p yo-cli
-    cp target/release/yodb $PREFIX/bin/yodb
+    cd $prefix/yo && cargo build --release -p yo-cli
+    cp target/release/yodb $prefix/bin/yodb
 
-    cd $PREFIX/yo-bench && cargo build --release
-    cp target/release/yobench $PREFIX/bin/yobench
+    cd $prefix/yo-bench && cargo build --release
+    cp target/release/yobench $prefix/bin/yobench
 
-    $PREFIX/bin/yodb --version
+    $prefix/bin/yodb --version
   '"
 done
 
