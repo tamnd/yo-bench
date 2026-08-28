@@ -240,16 +240,28 @@ fn check_and_size(plan: &mut Plan) -> Result<(), String> {
             filled = true;
         }
 
-        let probe = load::run(
-            case.driver,
-            case.op,
-            plan,
-            case.pipeline,
-            plan.requests,
-            true,
-        )
-        .map_err(|e| format!("calibrating {} {}: {e}", case.op, case.driver))?;
-        let rate = plan.requests as f64 / probe.seconds.max(1e-6);
+        // Twice, and the second one is the answer. The first probe runs into a
+        // cold store: an arena that has not grown to its working size, an index
+        // that has not either, and pages the process has never touched. On the
+        // first calibrated gate run that was worth a third, SET at pipeline 1
+        // probed at 121 thousand a second and then measured at 186, so a case
+        // asked for ten seconds of commands and finished in six and a half.
+        // The measured pass warms with a tenth of its run before it counts
+        // anything, so this is the same shape: pay for a warm store once, then
+        // time one.
+        let mut rate = 0.0;
+        for _ in 0..2 {
+            let probe = load::run(
+                case.driver,
+                case.op,
+                plan,
+                case.pipeline,
+                plan.requests,
+                true,
+            )
+            .map_err(|e| format!("calibrating {} {}: {e}", case.op, case.driver))?;
+            rate = plan.requests as f64 / probe.seconds.max(1e-6);
+        }
         let want = (rate * plan.min_seconds).ceil() as u64;
         let n = want.max(plan.requests).min(REQUEST_CEILING);
         eprintln!(
