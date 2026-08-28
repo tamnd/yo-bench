@@ -56,6 +56,8 @@ The `--io-threads 4` run is a confound check and not the headline. We are one sh
 
 ## Reading the output
 
-Each run writes `results/<host>-<plan>-<stamp>/` with `report.md`, `run.json` and the server logs. `results/` is not in the repository. Measurements are outputs, they go in a release note or an issue comment where the machine and the date are attached to them, not into the tree where they rot.
+Each run writes `results/<host>-<plan>-<stamp>/` with `report.md`, `run.json` and the server logs. `results/` is not in the repository. Raw output is not source, and a directory of it in the tree rots.
+
+A report that gets published is a different thing, and those live in `baselines/` under the date and the box that produced them, with a short preface saying what to read off it. `baselines/2026-08-29-gamingpc-tcp.md` is the first one: the full gate on gamingpc against Redis 8.10.1 and Valkey 9.1.1, and the first run where every wire row is scored against a ceiling measured on the same box in the same session.
 
 The report leads with the machine, including whether it is a virtual machine on shared hardware. A number from a VM is a baseline and not a ceiling, and saying so on the row is cheaper than arguing about it later.
