@@ -145,6 +145,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     eprintln!("{}", machine.summary());
     eprintln!("writing to {}\n", dir.display());
 
+    preflight(&plan, &dir)?;
     let rows = measure(&plan, &dir, opts.quiet)?;
     let report = Report {
         plan,
@@ -159,6 +160,45 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     println!("{md}");
     println!("written to {}", dir.display());
     Ok(ExitCode::SUCCESS)
+}
+
+/// Run every case once at a tiny size before measuring anything.
+///
+/// A plan is dozens of runs and it discovers a broken command line when it gets
+/// to it. The gate plan died an hour in, on the first INCR case, because memtier
+/// will not take `--key-pattern` and `--command-key-pattern` together: every SET
+/// and GET row had been measured by then and all of it was thrown away. Two
+/// thousand commands per case against the first target costs well under a minute
+/// and turns that into a failure in the first one.
+///
+/// The first target only. A command line that memtier refuses to parse is
+/// refused before it opens a socket, so it is not a fact about the server, and
+/// running it three times would be three copies of the same answer.
+fn preflight(plan: &Plan, dir: &std::path::Path) -> Result<(), String> {
+    let Some(target) = plan.targets.first() else {
+        return Ok(());
+    };
+    eprintln!(
+        "checking {} case(s) against {}",
+        plan.cases.len(),
+        target.name
+    );
+    let srv = Server::start(target, plan, dir)
+        .map_err(|e| format!("{} would not start: {e}", target.name))?;
+    let out = plan.cases.iter().try_for_each(|case| {
+        load::run(case.driver, case.op, plan, case.pipeline, 2000, true)
+            .map(|_| ())
+            .map_err(|e| {
+                format!(
+                    "{} {} pipeline {} will not run: {e}",
+                    case.op, case.driver, case.pipeline
+                )
+            })
+    });
+    srv.stop();
+    out?;
+    eprintln!("every case runs\n");
+    Ok(())
 }
 
 /// The measurement loop.
