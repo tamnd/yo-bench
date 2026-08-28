@@ -145,7 +145,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     eprintln!("{}", machine.summary());
     eprintln!("writing to {}\n", dir.display());
 
-    preflight(&plan, &dir)?;
+    preflight(&mut plan, &dir)?;
     let rows = measure(&plan, &dir, opts.quiet)?;
     let report = Report {
         plan,
@@ -162,20 +162,43 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Run every case once at a tiny size before measuring anything.
+/// The most commands a calibrated case is allowed to ask for.
 ///
-/// A plan is dozens of runs and it discovers a broken command line when it gets
-/// to it. The gate plan died an hour in, on the first INCR case, because memtier
-/// will not take `--key-pattern` and `--command-key-pattern` together: every SET
-/// and GET row had been measured by then and all of it was thrown away. Two
-/// thousand commands per case against the first target costs well under a minute
-/// and turns that into a failure in the first one.
+/// A guard rail on the arithmetic below and not a target. Two hundred million
+/// is about twenty times what the fastest row here has ever needed, and it is
+/// there so that a calibration run that came back nonsense costs a long run and
+/// not a run that never ends.
+const REQUEST_CEILING: u64 = 200_000_000;
+
+/// Check every case runs, then size each one so its measured run is long enough
+/// to mean something.
 ///
-/// The first target only. A command line that memtier refuses to parse is
-/// refused before it opens a socket, so it is not a fact about the server, and
-/// running it three times would be three copies of the same answer.
-fn preflight(plan: &Plan, dir: &std::path::Path) -> Result<(), String> {
-    let Some(target) = plan.targets.first() else {
+/// Two jobs in one pass because both need a server up and neither needs three.
+///
+/// The check first. A plan is dozens of runs and it used to discover a broken
+/// command line when it got to it: the gate plan died an hour in, on the first
+/// INCR case, because memtier will not take `--key-pattern` and
+/// `--command-key-pattern` together, by which point every SET and GET row had
+/// been measured and all of it was thrown away. Two thousand commands per case
+/// turns that into a failure in the first minute.
+///
+/// Then the sizing. One command count across every case cannot be right for all
+/// of them, because a pipeline 16 GET row and a pipeline 1 MSET row are twenty
+/// times apart: a million commands is ten seconds of one and half a second of
+/// the other, and half a second is under `redis-benchmark`'s resolution. So
+/// each case gets a short timed run, on our clock rather than the generator's,
+/// and a command count that puts the real run at [`Plan::min_seconds`].
+///
+/// Sized against the first target, which is ours and is the fastest thing here.
+/// A slower rival then runs for longer than the minimum, which is the right way
+/// round: the number that has to be resolvable is the one closest to the tick.
+///
+/// The first target only, for the check as well. A command line that memtier
+/// refuses to parse is refused before it opens a socket, so it is not a fact
+/// about the server and running it three times gives three copies of one
+/// answer.
+fn preflight(plan: &mut Plan, dir: &std::path::Path) -> Result<(), String> {
+    let Some(target) = plan.targets.first().cloned() else {
         return Ok(());
     };
     eprintln!(
@@ -183,20 +206,62 @@ fn preflight(plan: &Plan, dir: &std::path::Path) -> Result<(), String> {
         plan.cases.len(),
         target.name
     );
-    let srv = Server::start(target, plan, dir)
+    let srv = Server::start(&target, plan, dir)
         .map_err(|e| format!("{} would not start: {e}", target.name))?;
-    let out = plan.cases.iter().try_for_each(|case| {
-        load::run(case.driver, case.op, plan, case.pipeline, 2000, true)
-            .map(|_| ())
-            .map_err(|e| {
-                format!(
-                    "{} {} pipeline {} will not run: {e}",
-                    case.op, case.driver, case.pipeline
-                )
-            })
-    });
+
+    let out = check_and_size(plan);
     srv.stop();
-    out?;
+    out
+}
+
+fn check_and_size(plan: &mut Plan) -> Result<(), String> {
+    let cases = plan.cases.clone();
+    let mut filled = false;
+    let mut sized = Vec::with_capacity(cases.len());
+
+    for case in &cases {
+        load::run(case.driver, case.op, plan, case.pipeline, 2000, true).map_err(|e| {
+            format!(
+                "{} {} pipeline {} will not run: {e}",
+                case.op, case.driver, case.pipeline
+            )
+        })?;
+
+        if plan.min_seconds <= 0.0 {
+            sized.push(case.requests);
+            continue;
+        }
+        // A GET against an empty keyspace is a miss, and a miss is faster than
+        // a hit, so calibrating on one sizes the real run too short. Filled
+        // once and not once per case: the keys do not go anywhere between them.
+        if case.op == plan::Op::Get && !filled {
+            load::preload(case.driver, plan, true)
+                .map_err(|e| format!("filling to calibrate: {e}"))?;
+            filled = true;
+        }
+
+        let probe = load::run(
+            case.driver,
+            case.op,
+            plan,
+            case.pipeline,
+            plan.requests,
+            true,
+        )
+        .map_err(|e| format!("calibrating {} {}: {e}", case.op, case.driver))?;
+        let rate = plan.requests as f64 / probe.seconds.max(1e-6);
+        let want = (rate * plan.min_seconds).ceil() as u64;
+        let n = want.max(plan.requests).min(REQUEST_CEILING);
+        eprintln!(
+            "  {} {} pipeline {}: {:.0} commands for {:.0}s",
+            case.op, case.driver, case.pipeline, n, plan.min_seconds
+        );
+        sized.push(n);
+    }
+
+    for (case, n) in plan.cases.iter_mut().zip(sized) {
+        case.requests = n;
+    }
     eprintln!("every case runs\n");
     Ok(())
 }
@@ -229,7 +294,7 @@ fn measure(plan: &Plan, dir: &std::path::Path, quiet: bool) -> Result<Vec<Row>, 
                 // A tenth of the real run, thrown away. It pays for the page
                 // faults, the allocator's first growth and the branch
                 // predictor, none of which are what the row is about.
-                let warm = (plan.requests / 10).max(1000);
+                let warm = (case.requests / 10).max(1000);
                 load::run(case.driver, case.op, plan, case.pipeline, warm, true)
                     .map_err(|e| format!("warming {}: {e}", target.name))?;
             }
@@ -241,7 +306,7 @@ fn measure(plan: &Plan, dir: &std::path::Path, quiet: bool) -> Result<Vec<Row>, 
                     case.op,
                     plan,
                     case.pipeline,
-                    plan.requests,
+                    case.requests,
                     quiet,
                 )
                 .map_err(|e| format!("{} on {}: {e}", case.op, target.name))?;
@@ -260,8 +325,9 @@ fn measure(plan: &Plan, dir: &std::path::Path, quiet: bool) -> Result<Vec<Row>, 
             srv.stop();
 
             eprintln!(
-                "  {:>12.0} ops/sec, p50 {:.0} us, {} MiB peak\n",
+                "  {:>12.0} ops/sec over {:.1}s, p50 {:.0} us, {} MiB peak\n",
                 sample.ops,
+                sample.seconds,
                 sample.p50_us,
                 peak_kb / 1024
             );
@@ -276,6 +342,7 @@ fn measure(plan: &Plan, dir: &std::path::Path, quiet: bool) -> Result<Vec<Row>, 
                 ops: sample.ops,
                 p50_us: sample.p50_us,
                 p99_us: sample.p99_us,
+                seconds: sample.seconds,
                 rss_kb,
                 peak_kb,
                 cmdline: sample.cmdline,

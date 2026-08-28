@@ -136,6 +136,13 @@ pub struct Case {
     pub driver: Driver,
     /// How many commands are in flight per connection.
     pub pipeline: u32,
+    /// Commands in the measured run, once the calibration pass has sized it.
+    ///
+    /// Starts at [`Plan::requests`] and is raised, per case, until the run is
+    /// expected to last [`Plan::min_seconds`]. A pipeline 16 GET run and a
+    /// pipeline 1 MSET run are twenty times apart in throughput, so one command
+    /// count for both means one of them is far too short.
+    pub requests: u64,
 }
 
 /// Everything a run needs.
@@ -151,8 +158,27 @@ pub struct Plan {
     pub clients: u32,
     /// Generator threads. The load has to be able to saturate the server.
     pub threads: u32,
-    /// Total commands per measured run, across all connections.
+    /// Commands per measured run before the calibration pass raises it.
     pub requests: u64,
+    /// How long a measured run has to last.
+    ///
+    /// `redis-benchmark` stops on a 250 millisecond timer tick and divides the
+    /// request count by the wall clock it read there, so its reported rate is
+    /// the count over a multiple of 250 milliseconds. Two servers whose real
+    /// elapsed times differ by less than one tick come out on exactly the same
+    /// number: `redis-benchmark.c` defines `SHOW_THROUGHPUT_INTERVAL` as 250 and
+    /// `showThroughput` is the only thing that calls `aeStop`.
+    ///
+    /// That is what produced the first gate run's 1.00x rows. At a million
+    /// commands and pipeline 16 the runs took about three quarters of a second,
+    /// so one tick was a third of the run and yo, Redis and Valkey all reported
+    /// exactly 1,331,558 on SET and exactly 1,996,008 on GET. Rerun at four
+    /// million and the same three servers came out at 1.66M, 1.31M and 1.45M.
+    ///
+    /// Ten seconds puts one tick at two and a half percent, which is well under
+    /// anything this rig is trying to resolve. It costs about an hour on the
+    /// full gate plan, which is the price of the table meaning something.
+    pub min_seconds: f64,
     /// Value size in bytes.
     pub value_bytes: u32,
     /// How many distinct keys the run touches.
@@ -192,12 +218,13 @@ impl Plan {
                             op,
                             driver,
                             pipeline,
+                            requests: 0,
                         });
                     }
                 }
             }
         }
-        Plan {
+        let mut plan = Plan {
             name: "gate".to_string(),
             targets,
             cases,
@@ -207,6 +234,7 @@ impl Plan {
             clients: 48,
             threads: 4,
             requests: 1_000_000,
+            min_seconds: 10.0,
             value_bytes: 64,
             keyspace: 1_000_000,
             repeats: 3,
@@ -216,6 +244,19 @@ impl Plan {
             load_cpus: None,
             redis_benchmark,
             memtier,
+        };
+        plan.size_cases(plan.requests);
+        plan
+    }
+
+    /// Give every case the same command count.
+    ///
+    /// The starting point, and also what a run that skips calibration gets. A
+    /// zero here would be a plan that measures nothing, so it is set once when
+    /// the plan is built rather than left to whoever calls it.
+    pub fn size_cases(&mut self, requests: u64) {
+        for c in &mut self.cases {
+            c.requests = requests;
         }
     }
 
@@ -228,19 +269,27 @@ impl Plan {
                 op: Op::Set,
                 driver: Driver::RedisBenchmark,
                 pipeline: 1,
+                requests: 0,
             },
             Case {
                 op: Op::Get,
                 driver: Driver::RedisBenchmark,
                 pipeline: 16,
+                requests: 0,
             },
             Case {
                 op: Op::Set,
                 driver: Driver::Memtier,
                 pipeline: 16,
+                requests: 0,
             },
         ];
+        plan.size_cases(100_000);
         plan.requests = 100_000;
+        // A smoke run is for finding out that the rig works, and a rig that
+        // works is one that produced a number at all. Sizing every case to ten
+        // seconds would turn a two minute check into half an hour.
+        plan.min_seconds = 0.0;
         plan.repeats = 1;
         plan.warmup = false;
         plan
