@@ -22,11 +22,12 @@ set -eu
 
 [ $# -gt 0 ] || { echo "usage: suite/remote.sh host [host ...]" >&2; exit 2; }
 
+failed=""
+
 # Everything below builds one command string and sends it. shellcheck is right
 # that $PREFIX expands here and not there, and here is where it is wanted: the
 # prefix is this script's decision, not the remote shell's.
 # shellcheck disable=SC2029
-
 for host in "$@"; do
   printf '\n======== %s\n' "$host"
 
@@ -58,31 +59,46 @@ for host in "$@"; do
   # rather than scp because scp cannot reach inside WSL. Everything else comes
   # from git, because the builds are long and a box should be able to redo them
   # without this laptop being awake.
-  ssh "$host" "$via $sudo sh -c 'mkdir -p $prefix/suite'"
-  ssh "$host" "$via $sudo sh -c 'cat > $prefix/suite/provision.sh'" < suite/provision.sh
+  # One box failing is not four boxes failing. A run that stops at the first
+  # broken host means the other three sit unprovisioned for no reason, so every
+  # host is attempted and the failures are collected and reported at the end.
+  ok=yes
+  ssh "$host" "$via $sudo sh -c 'mkdir -p $prefix/suite'" || ok=no
+  if [ "$ok" = yes ]; then
+    ssh "$host" "$via $sudo sh -c 'cat > $prefix/suite/provision.sh'" < suite/provision.sh || ok=no
+  fi
 
   keep=""
   [ -n "$sudo" ] || keep="--keep-packages"
 
-  ssh "$host" "$via $sudo sh -eu -c '
-    chmod +x $prefix/suite/provision.sh
-    PREFIX=$prefix $prefix/suite/provision.sh $keep
+  if [ "$ok" = yes ]; then
+    ssh "$host" "$via $sudo sh -eu -c '
+      chmod +x $prefix/suite/provision.sh
+      PREFIX=$prefix $prefix/suite/provision.sh $keep
 
-    export PATH=\$HOME/.cargo/bin:\$PATH
+      export PATH=\$HOME/.cargo/bin:\$PATH
 
-    rm -rf $prefix/yo $prefix/yo-bench
-    git clone -q $YO_REPO $prefix/yo
-    git clone -q $BENCH_REPO $prefix/yo-bench
+      rm -rf $prefix/yo $prefix/yo-bench
+      git clone -q $YO_REPO $prefix/yo
+      git clone -q $BENCH_REPO $prefix/yo-bench
 
-    cd $prefix/yo && cargo build --release -p yo-cli
-    cp target/release/yodb $prefix/bin/yodb
+      cd $prefix/yo && cargo build --release -p yo-cli
+      cp target/release/yodb $prefix/bin/yodb
 
-    cd $prefix/yo-bench && cargo build --release
-    cp target/release/yobench $prefix/bin/yobench
+      cd $prefix/yo-bench && cargo build --release
+      cp target/release/yobench $prefix/bin/yobench
 
-    $prefix/bin/yodb --version
-  '"
+      $prefix/bin/yodb --version
+    '" || ok=no
+  fi
+
+  [ "$ok" = yes ] || { echo "$host: provisioning failed" >&2; failed="$failed $host"; }
 done
+
+if [ -n "$failed" ]; then
+  printf '\nthese boxes did not provision:%s\n' "$failed" >&2
+  exit 1
+fi
 
 printf '\nready. Run the plan on a box with:\n'
 printf '  ssh HOST %s/bin/yobench gate --prefix %s\n' "$PREFIX" "$PREFIX"

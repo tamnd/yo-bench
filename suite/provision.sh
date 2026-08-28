@@ -57,7 +57,7 @@ fetch() {
 
 # ---------------------------------------------------------------- build deps
 
-if command -v apt-get >/dev/null 2>&1; then
+if [ "$(id -u)" = 0 ] && command -v apt-get >/dev/null 2>&1; then
   say "build dependencies"
   export DEBIAN_FRONTEND=noninteractive
   # Not fatal. A box with one broken third party repository in sources.list.d
@@ -74,7 +74,30 @@ if command -v apt-get >/dev/null 2>&1; then
       build-essential pkg-config ca-certificates curl git \
       autoconf automake libtool \
       libssl-dev zlib1g-dev libevent-dev libpcre3-dev >/dev/null
+else
+  # Without root there is nothing to install and nothing to be done about it, so
+  # check for the tools instead of asking for them. A box that already has a
+  # compiler provisions perfectly well as an ordinary user, and one that does not
+  # should say which tool is missing rather than fail four minutes later inside
+  # somebody else's Makefile.
+  missing=""
+  for tool in cc make curl tar git; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+  done
+  if [ -n "$missing" ]; then
+    echo "provision: not root and these are not installed:$missing" >&2
+    echo "provision: install them, or rerun where sudo works" >&2
+    exit 1
+  fi
+  say "not root, using the tools already on the box"
 fi
+
+# memtier is the one thing here that needs autotools, because its tarball ships
+# without a configure script. Everything else builds with a plain make. A box
+# without autoreconf still gives real numbers from redis-benchmark, so the build
+# is skipped rather than fatal and the report says which generator is missing.
+MEMTIER_OK=yes
+command -v autoreconf >/dev/null 2>&1 || MEMTIER_OK=no
 
 # ------------------------------------------------------- the packaged rivals
 
@@ -82,7 +105,7 @@ fi
 # thing that was built here, and the surest way to break that is to leave a
 # second `redis-server` on PATH and a system unit already holding 6379. The
 # builds under $PREFIX carry their version in the file name for the same reason.
-if [ "$PURGE" = yes ] && command -v apt-get >/dev/null 2>&1; then
+if [ "$PURGE" = yes ] && [ "$(id -u)" = 0 ] && command -v apt-get >/dev/null 2>&1; then
   say "removing packaged redis and valkey"
   for unit in redis-server redis valkey-server valkey; do
     systemctl stop "$unit" >/dev/null 2>&1 || true
@@ -143,6 +166,9 @@ fi
 MEMTIER_BIN="$PREFIX/bin/memtier_benchmark-$MEMTIER_VERSION"
 if have "$MEMTIER_BIN"; then
   say "memtier $MEMTIER_VERSION already built"
+elif [ "$MEMTIER_OK" = no ]; then
+  say "no autoreconf on this box, skipping memtier"
+  echo "provision: only redis-benchmark cases can run here" >&2
 else
   say "memtier_benchmark $MEMTIER_VERSION"
   fetch "https://github.com/RedisLabs/memtier_benchmark/archive/refs/tags/$MEMTIER_VERSION.tar.gz" \
@@ -168,6 +194,10 @@ fi
 say "installed"
 for b in "$REDIS_BIN" "$VALKEY_BIN" "$MEMTIER_BIN" \
          "$PREFIX/bin/redis-benchmark-$REDIS_VERSION"; do
-  printf '  %s\n' "$("$b" --version 2>&1 | head -1)"
+  if [ -x "$b" ]; then
+    printf '  %s\n' "$("$b" --version 2>&1 | head -1)"
+  else
+    printf '  %s is not here\n' "$(basename "$b")"
+  fi
 done
 printf '\nPREFIX=%s\n' "$PREFIX"
