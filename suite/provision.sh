@@ -68,12 +68,19 @@ if [ "$(id -u)" = 0 ] && command -v apt-get >/dev/null 2>&1; then
   apt-get install -y -qq --no-install-recommends \
     build-essential pkg-config ca-certificates curl git \
     autoconf automake libtool \
-    libssl-dev zlib1g-dev libevent-dev libpcre3-dev \
-    linux-tools-common "linux-tools-$(uname -r)" >/dev/null 2>&1 ||
-    apt-get install -y -qq --no-install-recommends \
-      build-essential pkg-config ca-certificates curl git \
-      autoconf automake libtool \
-      libssl-dev zlib1g-dev libevent-dev libpcre3-dev >/dev/null
+    libssl-dev zlib1g-dev libevent-dev >/dev/null
+  # The rest are asked for one at a time, because whether a name exists depends
+  # on the release and one that does not must not take the rig down with it.
+  # Ubuntu 26.04 has no libpcre3-dev at all, pcre1 having been end of life for
+  # years, and a single apt-get for the whole list meant a 32 core box could not
+  # be provisioned over a regular expression library that memtier can take
+  # either version of. perf is the same kind of optional: it is per kernel, it
+  # is missing inside WSL and in most containers, and nothing here needs it to
+  # produce a number.
+  for pkg in libpcre2-dev libpcre3-dev linux-tools-common "linux-tools-$(uname -r)"; do
+    apt-get install -y -qq --no-install-recommends "$pkg" >/dev/null 2>&1 ||
+      echo "provision: no $pkg on this release, carrying on" >&2
+  done
 else
   # Without root there is nothing to install and nothing to be done about it, so
   # check for the tools instead of asking for them. A box that already has a
