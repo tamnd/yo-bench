@@ -1,3 +1,5 @@
-# Measurements are outputs, not source. They go in the report, not in the tree.
+# A run writes a directory of raw output, and that is not source. What gets
+# published is a report, and a published report is a document that goes in
+# baselines/ with the date and the box in its name.
 /results/
 /target/
