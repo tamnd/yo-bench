@@ -192,6 +192,9 @@ fn memtier_args(op: Op, plan: &Plan, pipeline: u32, requests: u64) -> (String, V
             args.push("--command=INCR __key__".into());
             args.push("--command-key-pattern=R".into());
         }
+        // No key in it, so no key pattern either. Passing one is the error
+        // described above rather than a setting that does nothing.
+        Op::Ping => args.push("--command=PING".into()),
         // Filtered out in `Driver::can_run`, and unreachable rather than silently
         // measuring the wrong thing if that ever changes.
         Op::Mset => unreachable!("memtier does not drive MSET"),

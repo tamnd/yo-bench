@@ -63,6 +63,36 @@ pub struct Row {
 /// applies to the rows redis-benchmark drove.
 const TICK: f64 = 0.25;
 
+/// The share of the measured `PING` ceiling a wire row has to reach.
+///
+/// `bench/00` section 4.2. A command sent over a socket cannot be ten times
+/// faster than a correct rival on the same box, because both of them pay for
+/// the same round trip and the round trip is nearly all of it. Measured on the
+/// gate box on 2026-08-29, `PING` at pipeline 1 ran at 147,967 for yo, 158,372
+/// for Redis and 148,110 for Valkey. Three servers with three event loops,
+/// three allocators and two languages, inside seven percent of each other on a
+/// command that does no work. Ten times Redis is 1,583,719, which is ten times
+/// faster than the wire, so the ratio bar was not a hard target on these rows,
+/// it was an unreachable one.
+///
+/// So a wire row is scored against the ceiling instead, the same way `bench/00`
+/// section 4.1 already scores a bandwidth bound command against `memcpy`. The
+/// ratio against the rivals stays in the table as context.
+///
+/// Eighty five percent, which is the number section 4.1 uses, kept the same
+/// here rather than picked again.
+const CEILING_SHARE: f64 = 0.85;
+
+/// How far apart the servers' `PING` numbers can be and still be a ceiling.
+///
+/// The claim that a number is the box's and not a server's rests on unrelated
+/// servers agreeing about it. If they stop agreeing, one of them is doing
+/// something the others are not and the row is a result again, so the ratio
+/// bar applies to it. Fifteen percent is loose enough to absorb the run to run
+/// spread this rig sees on a busy box and tight enough that a real difference
+/// in the network path shows up as one.
+const CEILING_AGREEMENT: f64 = 0.15;
+
 /// A key that identifies a case across targets.
 type Key = (String, String, u32);
 
@@ -92,6 +122,12 @@ pub struct Verdict {
     /// finished within one of its timer ticks of each other, which is the
     /// condition under which it reports both of them as the same number.
     pub unresolved: bool,
+    /// The fastest `PING` any server managed on this generator and depth.
+    ///
+    /// `None` when the plan did not measure one, or when the servers did not
+    /// agree closely enough for it to be called a ceiling, in which case this
+    /// row falls back to the ratio bar.
+    pub ceiling: Option<f64>,
 }
 
 impl Verdict {
@@ -108,15 +144,30 @@ impl Verdict {
     /// could not resolve is not evidence that we are slow any more than it is
     /// evidence that we are fast.
     pub fn passes(&self) -> bool {
-        !self.unresolved && self.ratio >= 10.0 && self.our_peak_kb <= self.best_rival_peak_kb
+        if self.our_peak_kb > self.best_rival_peak_kb {
+            return false;
+        }
+        match self.ceiling {
+            // A row with a ceiling on it is scored against the ceiling and the
+            // ratio is context. Nothing about the tick matters here: the bar is
+            // a share of a number measured on the same generator at the same
+            // depth, so both sides carry the same rounding.
+            Some(c) => self.ours >= CEILING_SHARE * c,
+            None => !self.unresolved && self.ratio >= 10.0,
+        }
+    }
+
+    /// How much of the ceiling this row reached, if there is one.
+    pub fn share(&self) -> Option<f64> {
+        self.ceiling.filter(|c| *c > 0.0).map(|c| self.ours / c)
     }
 
     /// What the verdict column says.
     pub fn verdict(&self) -> &'static str {
-        if self.unresolved {
-            "unresolved"
-        } else if self.passes() {
+        if self.passes() {
             "pass"
+        } else if self.ceiling.is_none() && self.unresolved {
+            "unresolved"
         } else {
             "fail"
         }
@@ -134,6 +185,32 @@ pub struct Report {
 }
 
 impl Report {
+    /// The fastest `PING` any server managed, per generator and pipeline depth.
+    ///
+    /// `None` for a depth the plan did not measure a `PING` at, and `None` when
+    /// the servers were more than [`CEILING_AGREEMENT`] apart on it, because
+    /// then it is not a fact about the box. Both cases send the row back to the
+    /// ratio bar rather than silently passing it.
+    pub fn ceiling(&self, driver: Driver, pipeline: u32) -> Option<f64> {
+        let pings: Vec<f64> = self
+            .rows
+            .iter()
+            .filter(|r| r.op == Op::Ping && r.driver == driver && r.pipeline == pipeline)
+            .map(|r| r.ops)
+            .collect();
+        // Two at the least, because one server agreeing with itself is not
+        // evidence of anything.
+        if pings.len() < 2 {
+            return None;
+        }
+        let hi = pings.iter().copied().fold(f64::MIN, f64::max);
+        let lo = pings.iter().copied().fold(f64::MAX, f64::min);
+        if hi <= 0.0 || (hi - lo) / hi > CEILING_AGREEMENT {
+            return None;
+        }
+        Some(hi)
+    }
+
     /// One verdict per case, in plan order.
     pub fn verdicts(&self) -> Vec<Verdict> {
         let mut ours: BTreeMap<Key, &Row> = BTreeMap::new();
@@ -149,6 +226,11 @@ impl Report {
 
         let mut out = Vec::new();
         for case in &self.plan.cases {
+            // The ceiling is not a case. It is what the other cases are scored
+            // against, and it goes in its own table.
+            if case.op == Op::Ping {
+                continue;
+            }
             let k = key(case.op, case.driver, case.pipeline);
             let (Some(mine), Some(theirs)) = (ours.get(&k), rivals.get(&k)) else {
                 continue;
@@ -184,6 +266,7 @@ impl Report {
                 our_peak_kb: mine.peak_kb,
                 best_rival_peak_kb: leanest,
                 unresolved,
+                ceiling: self.ceiling(case.driver, case.pipeline),
             });
         }
         out
@@ -239,28 +322,35 @@ impl Report {
         }
         let _ = writeln!(s);
 
+        self.ceiling_section(&mut s);
+
         let _ = writeln!(s, "## Against the best rival\n");
         let _ = writeln!(
             s,
-            "The ratio is ours over the faster of Redis and Valkey on the same row, and the memory column is ours against the leaner of the two. Ten times and no worse on memory is a pass.\n"
+            "The ratio is ours over the faster of Redis and Valkey on the same row, and the memory column is ours against the leaner of the two. The share column is ours over the PING ceiling for the same generator at the same pipeline depth, and where there is one it is the verdict: a row passes at {:.0} percent of the ceiling and no worse on memory. Where there is no ceiling the old bar applies, ten times the best rival and no worse on memory.\n",
+            CEILING_SHARE * 100.0
         );
         let _ = writeln!(
             s,
-            "A row marked unresolved is one redis-benchmark could not tell apart. It ends a run on a 250 millisecond timer tick and divides the request count by the clock it read there, so two servers that finished within a tick of each other come out on exactly the same number. The ratio on such a row is an artifact and means nothing. Runs are sized in a calibration pass to be long enough that this does not happen, so a row marked here is one where the sizing was overridden or the calibration was wrong.\n"
+            "A row marked unresolved is one redis-benchmark could not tell apart. It ends a run on a 250 millisecond timer tick and divides the request count by the clock it read there, so two servers that finished within a tick of each other come out on exactly the same number. The ratio on such a row is an artifact and means nothing. Runs are sized in a calibration pass to be long enough that this does not happen, so a row marked here is one where the sizing was overridden or the calibration was wrong. Only rows scored on the ratio can be unresolved, because the ceiling bar does not compare two servers.\n"
         );
         let _ = writeln!(
             s,
-            "| command | generator | pipeline | yo ops/sec | best rival | rival ops/sec | ratio | yo peak MiB | rival peak MiB | verdict |"
+            "| command | generator | pipeline | yo ops/sec | best rival | rival ops/sec | ratio | share | yo peak MiB | rival peak MiB | verdict |"
         );
         let _ = writeln!(
             s,
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
         );
         let verdicts = self.verdicts();
         for v in &verdicts {
+            let share = match v.share() {
+                Some(x) => format!("{:.0}%", x * 100.0),
+                None => "-".to_string(),
+            };
             let _ = writeln!(
                 s,
-                "| {} | {} | {} | {} | {} | {} | {:.2}x | {:.1} | {:.1} | {} |",
+                "| {} | {} | {} | {} | {} | {} | {:.2}x | {} | {:.1} | {:.1} | {} |",
                 v.case.op,
                 v.case.driver,
                 v.case.pipeline,
@@ -268,6 +358,7 @@ impl Report {
                 v.best_rival_name,
                 thousands(v.best_rival),
                 v.ratio,
+                share,
                 mib(v.our_peak_kb),
                 mib(v.best_rival_peak_kb),
                 v.verdict(),
@@ -276,7 +367,11 @@ impl Report {
         let _ = writeln!(s);
 
         let passed = verdicts.iter().filter(|v| v.passes()).count();
-        let bound = verdicts.iter().filter(|v| v.unresolved).count();
+        let bound = verdicts
+            .iter()
+            .filter(|v| v.ceiling.is_none() && v.unresolved)
+            .count();
+        let on_ceiling = verdicts.iter().filter(|v| v.ceiling.is_some()).count();
         // The worst ratio is over the rows that measured something. Including
         // an unresolved row would put a 1.00x in the summary line that no
         // server earned.
@@ -294,7 +389,7 @@ impl Report {
         } else {
             let _ = writeln!(
                 s,
-                "{passed} of {} cases clear ten times, and the worst case that measured a server is {worst:.2}x.",
+                "{passed} of {} cases pass, {on_ceiling} of them against the ceiling and the rest against the ratio. The worst ratio on a row that measured a server is {worst:.2}x.",
                 verdicts.len()
             );
             if bound > 0 {
@@ -319,6 +414,63 @@ impl Report {
         s
     }
 
+    /// The `PING` table and what it means, written into the report.
+    ///
+    /// This goes above the verdict table on purpose. It is the number every row
+    /// below it is judged against, and a reader who sees the ratios first will
+    /// read them as a result.
+    fn ceiling_section(&self, s: &mut String) {
+        let pings: Vec<&Row> = self.rows.iter().filter(|r| r.op == Op::Ping).collect();
+        if pings.is_empty() {
+            return;
+        }
+        let _ = writeln!(s, "## The ceiling\n");
+        let _ = writeln!(
+            s,
+            "PING reads no key, allocates nothing and frames a four byte reply, so whatever it runs at is the fastest anything can answer a client on this box over this transport. It is measured here for every server under test, not just ours, because the point of the number is that it belongs to the box and not to a server. Three unrelated servers landing within a few percent of each other is the evidence for that. If they come apart by more than {:.0} percent the number is not a ceiling, this report says so, and the rows fall back to being scored against the rivals.\n",
+            CEILING_AGREEMENT * 100.0
+        );
+        let _ = writeln!(s, "| generator | pipeline | server | ops/sec |");
+        let _ = writeln!(s, "| --- | --- | --- | --- |");
+        for r in &pings {
+            let _ = writeln!(
+                s,
+                "| {} | {} | {} | {} |",
+                r.driver,
+                r.pipeline,
+                r.target,
+                thousands(r.ops)
+            );
+        }
+        let _ = writeln!(s);
+
+        let mut seen: Vec<(Driver, u32)> = Vec::new();
+        for r in &pings {
+            if !seen.contains(&(r.driver, r.pipeline)) {
+                seen.push((r.driver, r.pipeline));
+            }
+        }
+        for (driver, pipeline) in seen {
+            match self.ceiling(driver, pipeline) {
+                Some(c) => {
+                    let _ = writeln!(
+                        s,
+                        "The {driver} ceiling at pipeline {pipeline} is {} per second, so a row on that generator and depth passes at {}.",
+                        thousands(c),
+                        thousands(c * CEILING_SHARE)
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        s,
+                        "The servers did not agree on PING under {driver} at pipeline {pipeline}, so there is no ceiling at that generator and depth and those rows are scored against the rivals."
+                    );
+                }
+            }
+        }
+        let _ = writeln!(s);
+    }
+
     /// The JSON another program reads.
     ///
     /// Written by hand because everything in it is a number or a string with
@@ -337,6 +489,32 @@ impl Report {
         let _ = writeln!(s, "  \"requests\": {},", self.plan.requests);
         let _ = writeln!(s, "  \"value_bytes\": {},", self.plan.value_bytes);
         let _ = writeln!(s, "  \"keyspace\": {},", self.plan.keyspace);
+        // The bar the wire rows were judged against, so a reader of the JSON
+        // does not have to rederive it from the PING rows.
+        s.push_str("  \"ceiling\": [");
+        let mut ceilings = Vec::new();
+        for r in self.rows.iter().filter(|r| r.op == Op::Ping) {
+            let k = (r.driver, r.pipeline);
+            if !ceilings.iter().any(|(d, p): &(Driver, u32)| (*d, *p) == k) {
+                ceilings.push(k);
+            }
+        }
+        for (i, (driver, pipeline)) in ceilings.iter().enumerate() {
+            let comma = if i + 1 == ceilings.len() { "" } else { "," };
+            let ops = match self.ceiling(*driver, *pipeline) {
+                Some(c) => format!("{c:.2}"),
+                None => "null".to_string(),
+            };
+            let _ = write!(
+                s,
+                "\n    {{\"generator\": \"{driver}\", \"pipeline\": {pipeline}, \"ops\": {ops}}}{comma}"
+            );
+        }
+        s.push_str(if ceilings.is_empty() {
+            "],\n"
+        } else {
+            "\n  ],\n"
+        });
         s.push_str("  \"rows\": [\n");
         for (i, r) in self.rows.iter().enumerate() {
             let comma = if i + 1 == self.rows.len() { "" } else { "," };
@@ -537,6 +715,167 @@ mod tests {
         let v = r.verdicts();
         assert!(!v[0].unresolved);
         assert_eq!(v[0].verdict(), "fail");
+    }
+
+    fn ping(target: &str, kind: Kind, ops: f64) -> Row {
+        let mut r = rb_row(target, kind, ops, 10_000, Driver::RedisBenchmark);
+        r.op = Op::Ping;
+        r
+    }
+
+    /// Add the ceiling to a report the way a real session would.
+    ///
+    /// The measured pass writes a `PING` row per server and the plan carries a
+    /// `PING` case, so both halves are put in here rather than just the rows.
+    fn with_ceiling(mut r: Report, pings: Vec<Row>) -> Report {
+        r.plan.cases.insert(
+            0,
+            Case {
+                op: Op::Ping,
+                driver: Driver::RedisBenchmark,
+                pipeline: 1,
+                requests: N as u64,
+            },
+        );
+        for p in pings {
+            r.rows.push(p);
+        }
+        r
+    }
+
+    /// The numbers from the gate box on 2026-08-29, at pipeline 1.
+    fn real_pings() -> Vec<Row> {
+        vec![
+            ping("yo", Kind::Yo, 147_967.0),
+            ping("redis", Kind::Redis, 158_372.0),
+            ping("valkey", Kind::Valkey, 148_110.0),
+        ]
+    }
+
+    /// Three servers inside seven percent is a fact about the box.
+    #[test]
+    fn a_ceiling_is_the_fastest_of_servers_that_agree() {
+        let r = with_ceiling(
+            report(vec![
+                row("yo", Kind::Yo, 140_000.0, 10_000),
+                row("redis", Kind::Redis, 130_000.0, 40_000),
+            ]),
+            real_pings(),
+        );
+        let c = r
+            .ceiling(Driver::RedisBenchmark, 1)
+            .expect("seven percent apart is a ceiling");
+        assert!((c - 158_372.0).abs() < 1e-9);
+    }
+
+    /// A row at nine tenths of the wire is a pass at 1.08x the rival.
+    ///
+    /// This is the whole point of the change. Ten times 130,000 is 1.3 million
+    /// on a box where nothing can answer faster than 158,372, so the ratio bar
+    /// failed a row that had taken almost everything there was to take.
+    #[test]
+    fn a_wire_row_is_scored_against_the_ceiling_and_not_the_rival() {
+        let r = with_ceiling(
+            report(vec![
+                row("yo", Kind::Yo, 140_000.0, 10_000),
+                row("redis", Kind::Redis, 130_000.0, 40_000),
+            ]),
+            real_pings(),
+        );
+        let v = r.verdicts();
+        assert_eq!(v.len(), 1, "the PING case is not a workload row");
+        assert!(v[0].ratio < 1.1);
+        assert!(v[0].passes(), "88 percent of the ceiling is a pass");
+        assert_eq!(v[0].verdict(), "pass");
+    }
+
+    #[test]
+    fn a_wire_row_well_under_the_ceiling_still_fails() {
+        let r = with_ceiling(
+            report(vec![
+                row("yo", Kind::Yo, 100_000.0, 10_000),
+                row("redis", Kind::Redis, 130_000.0, 40_000),
+            ]),
+            real_pings(),
+        );
+        assert!(!r.verdicts()[0].passes(), "63 percent of the ceiling");
+    }
+
+    /// Memory still decides, however close to the wire the row got.
+    #[test]
+    fn the_ceiling_does_not_excuse_losing_on_memory() {
+        let r = with_ceiling(
+            report(vec![
+                row("yo", Kind::Yo, 150_000.0, 100_000),
+                row("redis", Kind::Redis, 130_000.0, 40_000),
+            ]),
+            real_pings(),
+        );
+        assert!(!r.verdicts()[0].passes());
+    }
+
+    /// If the servers stop agreeing, the number was never a ceiling.
+    #[test]
+    fn servers_far_apart_on_ping_do_not_make_a_ceiling() {
+        let pings = vec![
+            ping("yo", Kind::Yo, 300_000.0),
+            ping("redis", Kind::Redis, 158_372.0),
+            ping("valkey", Kind::Valkey, 148_110.0),
+        ];
+        let r = with_ceiling(
+            report(vec![
+                row("yo", Kind::Yo, 140_000.0, 10_000),
+                row("redis", Kind::Redis, 130_000.0, 40_000),
+            ]),
+            pings,
+        );
+        assert!(r.ceiling(Driver::RedisBenchmark, 1).is_none());
+        let v = r.verdicts();
+        assert!(v[0].ceiling.is_none());
+        assert!(!v[0].passes(), "back to the ratio bar, and 1.08x fails it");
+    }
+
+    /// One server agreeing with itself is not evidence of anything.
+    #[test]
+    fn one_server_alone_is_not_a_ceiling() {
+        let r = with_ceiling(
+            report(vec![
+                row("yo", Kind::Yo, 140_000.0, 10_000),
+                row("redis", Kind::Redis, 130_000.0, 40_000),
+            ]),
+            vec![ping("yo", Kind::Yo, 147_967.0)],
+        );
+        assert!(r.ceiling(Driver::RedisBenchmark, 1).is_none());
+    }
+
+    /// A ceiling is per generator and per depth, not one number for the run.
+    #[test]
+    fn a_ceiling_does_not_carry_across_generators_or_depths() {
+        let r = with_ceiling(
+            report(vec![
+                row("yo", Kind::Yo, 140_000.0, 10_000),
+                row("redis", Kind::Redis, 130_000.0, 40_000),
+            ]),
+            real_pings(),
+        );
+        assert!(r.ceiling(Driver::Memtier, 1).is_none());
+        assert!(r.ceiling(Driver::RedisBenchmark, 16).is_none());
+    }
+
+    /// The tick label is about telling two servers apart, which the ceiling
+    /// bar does not do, so a row scored on the ceiling is never unresolved.
+    #[test]
+    fn a_row_with_a_ceiling_is_never_reported_as_unresolved() {
+        let r = with_ceiling(
+            report(vec![
+                row("yo", Kind::Yo, 140_000.0, 10_000),
+                row("redis", Kind::Redis, 140_000.0, 40_000),
+            ]),
+            real_pings(),
+        );
+        let v = r.verdicts();
+        assert!(v[0].unresolved, "the rates are identical");
+        assert_eq!(v[0].verdict(), "pass");
     }
 
     #[test]

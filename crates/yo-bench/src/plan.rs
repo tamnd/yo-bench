@@ -20,6 +20,14 @@ pub enum Op {
     Get,
     /// Read, add one, write, reply with the number.
     Incr,
+    /// Reply, and touch nothing.
+    ///
+    /// Not a workload. This is the ceiling: `PING` allocates nothing, reads no
+    /// key and frames a four byte reply, so whatever it runs at is the fastest
+    /// anything can answer a client on this box over this transport. Every
+    /// other row on the same generator and pipeline depth is measured against
+    /// it. See [`Plan::gate`] and `bench/00` section 4.2.
+    Ping,
     /// Write ten keys in one command.
     ///
     /// `redis-benchmark` counts the command and not the ten keys, so an MSET
@@ -39,6 +47,10 @@ impl Op {
             Op::Get => "get",
             Op::Incr => "incr",
             Op::Mset => "mset",
+            // The multi bulk form and not the inline one, because inline PING
+            // is a different number of bytes on the wire and no real client
+            // sends it.
+            Op::Ping => "ping_mbulk",
         }
     }
 }
@@ -50,6 +62,7 @@ impl fmt::Display for Op {
             Op::Get => "GET",
             Op::Incr => "INCR",
             Op::Mset => "MSET",
+            Op::Ping => "PING",
         })
     }
 }
@@ -210,6 +223,18 @@ impl Plan {
     /// claim about the server.
     pub fn gate(targets: Vec<Target>, redis_benchmark: String, memtier: String) -> Plan {
         let mut cases = Vec::new();
+        // The ceiling first, so that a report that died halfway still says what
+        // the box could do at all.
+        for pipeline in [1, 16] {
+            for driver in [Driver::RedisBenchmark, Driver::Memtier] {
+                cases.push(Case {
+                    op: Op::Ping,
+                    driver,
+                    pipeline,
+                    requests: 0,
+                });
+            }
+        }
         for pipeline in [1, 16] {
             for op in [Op::Set, Op::Get, Op::Incr, Op::Mset] {
                 for driver in [Driver::RedisBenchmark, Driver::Memtier] {
