@@ -173,30 +173,14 @@ const REQUEST_CEILING: u64 = 200_000_000;
 /// Check every case runs, then size each one so its measured run is long enough
 /// to mean something.
 ///
-/// Two jobs in one pass because both need a server up and neither needs three.
-///
-/// The check first. A plan is dozens of runs and it used to discover a broken
-/// command line when it got to it: the gate plan died an hour in, on the first
-/// INCR case, because memtier will not take `--key-pattern` and
-/// `--command-key-pattern` together, by which point every SET and GET row had
-/// been measured and all of it was thrown away. Two thousand commands per case
-/// turns that into a failure in the first minute.
-///
-/// Then the sizing. One command count across every case cannot be right for all
-/// of them, because a pipeline 16 GET row and a pipeline 1 MSET row are twenty
-/// times apart: a million commands is ten seconds of one and half a second of
-/// the other, and half a second is under `redis-benchmark`'s resolution. So
-/// each case gets a short timed run, on our clock rather than the generator's,
-/// and a command count that puts the real run at [`Plan::min_seconds`].
-///
-/// Sized against the first target, which is ours and is the fastest thing here.
-/// A slower rival then runs for longer than the minimum, which is the right way
-/// round: the number that has to be resolvable is the one closest to the tick.
+/// Two jobs and two passes, both against the first target, which is ours and is
+/// the fastest thing here. A slower rival then runs for longer than the minimum,
+/// which is the right way round: the number that has to be resolvable is the one
+/// closest to the tick.
 ///
 /// The first target only, for the check as well. A command line that memtier
 /// refuses to parse is refused before it opens a socket, so it is not a fact
-/// about the server and running it three times gives three copies of one
-/// answer.
+/// about the server and running it three times gives three copies of one answer.
 fn preflight(plan: &mut Plan, dir: &std::path::Path) -> Result<(), String> {
     let Some(target) = plan.targets.first().cloned() else {
         return Ok(());
@@ -206,76 +190,116 @@ fn preflight(plan: &mut Plan, dir: &std::path::Path) -> Result<(), String> {
         plan.cases.len(),
         target.name
     );
-    let srv = Server::start(&target, plan, dir)
-        .map_err(|e| format!("{} would not start: {e}", target.name))?;
+    check(plan, &target, dir)?;
+    if plan.min_seconds > 0.0 {
+        size(plan, &target, dir)?;
+    }
+    eprintln!("every case runs\n");
+    Ok(())
+}
 
-    let out = check_and_size(plan);
+/// Run two thousand commands of every case, on one server, and stop at the
+/// first one that will not run.
+///
+/// A plan is dozens of runs and it used to discover a broken command line when
+/// it got to it: the gate plan died an hour in, on the first INCR case, because
+/// memtier will not take `--key-pattern` and `--command-key-pattern` together,
+/// by which point every SET and GET row had been measured and all of it was
+/// thrown away. Two thousand commands per case turns that into a failure in the
+/// first minute, and it stays a separate pass in front of the sizing below so
+/// that it keeps that property: sizing costs a fill and two probes per case, so
+/// a broken line found during it would be found minutes in rather than seconds.
+fn check(plan: &Plan, target: &plan::Target, dir: &std::path::Path) -> Result<(), String> {
+    let srv = Server::start(target, plan, dir)
+        .map_err(|e| format!("{} would not start: {e}", target.name))?;
+    let mut out = Ok(());
+    for case in &plan.cases {
+        out = load::run(case.driver, case.op, plan, case.pipeline, 2000, true)
+            .map(|_| ())
+            .map_err(|e| {
+                format!(
+                    "{} {} pipeline {} will not run: {e}",
+                    case.op, case.driver, case.pipeline
+                )
+            });
+        if out.is_err() {
+            break;
+        }
+    }
     srv.stop();
     out
 }
 
-fn check_and_size(plan: &mut Plan) -> Result<(), String> {
+/// Give every case its own command count, so that its measured run lasts
+/// [`Plan::min_seconds`].
+///
+/// One count across every case cannot be right for all of them, because a
+/// pipeline 16 GET row and a pipeline 1 MSET row are twenty times apart: a
+/// million commands is ten seconds of one and half a second of the other, and
+/// half a second is under `redis-benchmark`'s resolution. So each case gets a
+/// timed run of its own, on our clock rather than the generator's, and a count
+/// that scales it up to the minimum.
+fn size(plan: &mut Plan, target: &plan::Target, dir: &std::path::Path) -> Result<(), String> {
     let cases = plan.cases.clone();
-    let mut filled = false;
     let mut sized = Vec::with_capacity(cases.len());
-
     for case in &cases {
-        load::run(case.driver, case.op, plan, case.pipeline, 2000, true).map_err(|e| {
-            format!(
-                "{} {} pipeline {} will not run: {e}",
-                case.op, case.driver, case.pipeline
-            )
-        })?;
-
-        if plan.min_seconds <= 0.0 {
-            sized.push(case.requests);
-            continue;
-        }
-        // A GET against an empty keyspace is a miss, and a miss is faster than
-        // a hit, so calibrating on one sizes the real run too short. Filled
-        // once and not once per case: the keys do not go anywhere between them.
-        if case.op == plan::Op::Get && !filled {
-            load::preload(case.driver, plan, true)
-                .map_err(|e| format!("filling to calibrate: {e}"))?;
-            filled = true;
-        }
-
-        // Twice, and the second one is the answer. The first probe runs into a
-        // cold store: an arena that has not grown to its working size, an index
-        // that has not either, and pages the process has never touched. On the
-        // first calibrated gate run that was worth a third, SET at pipeline 1
-        // probed at 121 thousand a second and then measured at 186, so a case
-        // asked for ten seconds of commands and finished in six and a half.
-        // The measured pass warms with a tenth of its run before it counts
-        // anything, so this is the same shape: pay for a warm store once, then
-        // time one.
-        let mut rate = 0.0;
-        for _ in 0..2 {
-            let probe = load::run(
-                case.driver,
-                case.op,
-                plan,
-                case.pipeline,
-                plan.requests,
-                true,
-            )
-            .map_err(|e| format!("calibrating {} {}: {e}", case.op, case.driver))?;
-            rate = plan.requests as f64 / probe.seconds.max(1e-6);
-        }
-        let want = (rate * plan.min_seconds).ceil() as u64;
-        let n = want.max(plan.requests).min(REQUEST_CEILING);
+        let srv = Server::start(target, plan, dir)
+            .map_err(|e| format!("{} would not start: {e}", target.name))?;
+        let n = size_one(plan, case);
+        srv.stop();
+        let n = n?;
         eprintln!(
             "  {} {} pipeline {}: {:.0} commands for {:.0}s",
             case.op, case.driver, case.pipeline, n, plan.min_seconds
         );
         sized.push(n);
     }
-
     for (case, n) in plan.cases.iter_mut().zip(sized) {
         case.requests = n;
     }
-    eprintln!("every case runs\n");
     Ok(())
+}
+
+/// Time one case on a server of its own and say how many commands it needs.
+///
+/// A server of its own, and filled the same way, because the measured pass does
+/// both and a probe against a server in some other state sizes the wrong run.
+/// This was measured: sharing one server across the whole sizing pass left the
+/// INCR cases probing at under a tenth of what they then measured, because by
+/// the time they ran, an earlier GET case had filled the keyspace with 64 byte
+/// strings and every INCR was landing on one of them and coming back an error.
+/// Both INCR cases fell to the floor of a million commands and the pipeline 16
+/// one measured for a third of a second.
+fn size_one(plan: &Plan, case: &plan::Case) -> Result<u64, String> {
+    // A GET against an empty keyspace is a miss, and a miss is faster than a
+    // hit, so calibrating on one sizes the real run too short.
+    if case.op == plan::Op::Get {
+        load::preload(case.driver, plan, true).map_err(|e| format!("filling to calibrate: {e}"))?;
+    }
+
+    // Twice, and the second one is the answer. The first probe runs into a cold
+    // store: an arena that has not grown to its working size, an index that has
+    // not either, and pages the process has never touched. On the first
+    // calibrated gate run that was worth a third, SET at pipeline 1 probed at
+    // 121 thousand a second and then measured at 186, so a case asked for ten
+    // seconds of commands and finished in six and a half. The measured pass
+    // warms with a tenth of its run before it counts anything, so this is the
+    // same shape: pay for a warm store once, then time one.
+    let mut rate = 0.0;
+    for _ in 0..2 {
+        let probe = load::run(
+            case.driver,
+            case.op,
+            plan,
+            case.pipeline,
+            plan.requests,
+            true,
+        )
+        .map_err(|e| format!("calibrating {} {}: {e}", case.op, case.driver))?;
+        rate = plan.requests as f64 / probe.seconds.max(1e-6);
+    }
+    let want = (rate * plan.min_seconds).ceil() as u64;
+    Ok(want.max(plan.requests).min(REQUEST_CEILING))
 }
 
 /// The measurement loop.
