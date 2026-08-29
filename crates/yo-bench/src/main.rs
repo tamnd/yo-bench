@@ -258,6 +258,17 @@ fn size(plan: &mut Plan, target: &plan::Target, dir: &std::path::Path) -> Result
     let cases = plan.cases.clone();
     let mut sized = Vec::with_capacity(cases.len());
     for case in &cases {
+        // An op whose count comes out of its fixture is not up for calibration,
+        // and probing one that drains would empty the set before the measured
+        // pass ever ran. Nothing to start a server for.
+        if let Some(n) = case.op.fixed_requests() {
+            eprintln!(
+                "  {} {} pipeline {}: {n} commands, fixed by the fixture",
+                case.op, case.driver, case.pipeline
+            );
+            sized.push(n);
+            continue;
+        }
         let srv = Server::start(target, plan, dir)
             .map_err(|e| format!("{} would not start: {e}", target.name))?;
         let n = size_one(plan, case);
@@ -275,6 +286,23 @@ fn size(plan: &mut Plan, target: &plan::Target, dir: &std::path::Path) -> Result
     Ok(())
 }
 
+/// Put the database into the state this case expects to find it in.
+///
+/// Two shapes and they do not overlap. GET wants a keyspace full of strings,
+/// built by whichever generator is about to read it because the two of them name
+/// keys differently. The set reads want particular keys holding particular
+/// members, which is [`plan::Op::fixtures`] and is always built by memtier.
+/// Everything else wants nothing and gets nothing.
+fn setup(case: &plan::Case, plan: &Plan, quiet: bool) -> Result<(), String> {
+    if case.op == plan::Op::Get {
+        load::preload(case.driver, plan, quiet).map_err(|e| format!("filling: {e}"))?;
+    }
+    for fx in case.op.fixtures() {
+        load::build(plan, fx, quiet).map_err(|e| format!("building {}: {e}", fx.key))?;
+    }
+    Ok(())
+}
+
 /// Time one case on a server of its own and say how many commands it needs.
 ///
 /// A server of its own, and filled the same way, because the measured pass does
@@ -287,10 +315,11 @@ fn size(plan: &mut Plan, target: &plan::Target, dir: &std::path::Path) -> Result
 /// one measured for a third of a second.
 fn size_one(plan: &Plan, case: &plan::Case) -> Result<u64, String> {
     // A GET against an empty keyspace is a miss, and a miss is faster than a
-    // hit, so calibrating on one sizes the real run too short.
-    if case.op == plan::Op::Get {
-        load::preload(case.driver, plan, true).map_err(|e| format!("filling to calibrate: {e}"))?;
-    }
+    // hit, so calibrating on one sizes the real run too short. Same argument
+    // for the set reads, one step further along: SRANDMEMBER against a key that
+    // is not there is a null reply and would size its run at the rate a server
+    // produces nulls.
+    setup(case, plan, true).map_err(|e| format!("setting up to calibrate: {e}"))?;
 
     // Twice, and the second one is the answer. The first probe runs into a cold
     // store: an arena that has not grown to its working size, an index that has
@@ -346,20 +375,32 @@ fn measure(plan: &Plan, dir: &std::path::Path, quiet: bool) -> Result<Vec<Row>, 
 
             // A read case needs something to read. Everything else builds its
             // own keys as it goes.
-            if case.op == plan::Op::Get {
-                load::preload(case.driver, plan, quiet)
-                    .map_err(|e| format!("filling for {}: {e}", target.name))?;
+            let needs_setup = case.op == plan::Op::Get || !case.op.fixtures().is_empty();
+            if needs_setup {
+                setup(case, plan, quiet)
+                    .map_err(|e| format!("setting up for {}: {e}", target.name))?;
             } else if plan.warmup {
                 // A tenth of the real run, thrown away. It pays for the page
                 // faults, the allocator's first growth and the branch
-                // predictor, none of which are what the row is about.
+                // predictor, none of which are what the row is about. A case
+                // that had a setup pass does not need this: filling a keyspace
+                // or building a four million member set is millions of writes
+                // against the same server and warms it far better than a tenth
+                // of the run would have.
                 let warm = (case.requests / 10).max(1000);
                 load::run(case.driver, case.op, plan, case.pipeline, warm, true)
                     .map_err(|e| format!("warming {}: {e}", target.name))?;
             }
 
             let mut best: Option<load::Sample> = None;
-            for _ in 0..plan.repeats {
+            for pass in 0..plan.repeats {
+                // A draining op ate its fixture last time round, so the next
+                // pass gets a fresh one. Everything else leaves the setup
+                // exactly as it found it and reuses it.
+                if pass > 0 && case.op.drains() {
+                    setup(case, plan, quiet)
+                        .map_err(|e| format!("rebuilding for {}: {e}", target.name))?;
+                }
                 let s = load::run(
                     case.driver,
                     case.op,

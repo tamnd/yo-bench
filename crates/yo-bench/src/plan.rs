@@ -45,15 +45,117 @@ pub enum Op {
     /// exploit. That is the shape aki came in at 0.82x on and the shape the M3
     /// gate is written against.
     ///
-    /// The other four set commands the M3 gate wants are not here yet, and the
-    /// reason is the fixture rather than the plumbing. SPOP, SRANDMEMBER,
-    /// SINTER and SUNION all need a set that already has members in it, and a
-    /// ten second SPOP run at two million a second would drain a million member
-    /// set in half a second and spend the rest of the run measuring how fast a
-    /// server can say the set is empty. Sizing that fill is its own piece of
-    /// work and it gets its own change.
+    /// The four commands below need a set that already has members in it, which
+    /// is what [`Fixture`] is for.
     Sadd,
+    /// Take a member out of a set and give it back.
+    ///
+    /// The one row where the run empties the thing it is measuring. Everything
+    /// awkward about it follows from that: it cannot be calibrated by probing,
+    /// because the probe would drain the set before the measured pass got to
+    /// it, and it cannot run for ten seconds, because at two million a second
+    /// ten seconds is twenty million pops and no fixture worth building is that
+    /// big. So it runs a fixed count against a fixture sized above it, and the
+    /// report carries the shorter elapsed time rather than pretending.
+    Spop,
+    /// Draw a member out of a set and leave it there.
+    ///
+    /// The same shape as SPOP with the awkward part removed. It touches one
+    /// key, does one draw and changes nothing, so the fixture is built once and
+    /// every pass sees the same set.
+    Srandmember,
+    /// Everything in both of two sets.
+    Sinter,
+    /// Everything in either of two sets.
+    ///
+    /// The reply is most of what this costs: two thousand member sets with a
+    /// five hundred member overlap union to fifteen hundred members, so every
+    /// command frames fifteen hundred bulk strings. That is what SUNION is, for
+    /// us and for the rivals equally, and a row that cut the sets down until
+    /// the reply stopped mattering would be measuring something nobody runs.
+    Sunion,
 }
+
+/// A collection that has to exist before a command can be measured against it.
+///
+/// Members are named the way memtier names keys, `memtier-<n>` for n in the
+/// range, so two fixtures overlap by however much their ranges overlap and by
+/// nothing else. That is the whole reason the range is spelled out here instead
+/// of a count: SINTER against two sets that happen to share nothing is a
+/// benchmark of returning the empty array.
+///
+/// The fill is a random draw over the range rather than a walk across it,
+/// because a walk has to come off one connection to stay in order and a draw
+/// can use all of them. Coverage is 1 - e^(-n/k) and the builder sends five
+/// times the range, so a fixture is about 99.3 percent of its nominal size.
+/// Nothing here depends on the exact count and every server gets the same
+/// treatment, so the fraction of a percent is left alone.
+#[derive(Debug, Clone, Copy)]
+pub struct Fixture {
+    /// The key to build.
+    pub key: &'static str,
+    /// The lowest member id.
+    pub from: u64,
+    /// How many ids the range covers.
+    pub members: u64,
+}
+
+impl Fixture {
+    /// The highest member id.
+    pub fn to(&self) -> u64 {
+        self.from + self.members - 1
+    }
+}
+
+/// Members in the set SPOP empties.
+const POP_MEMBERS: u64 = 4_000_000;
+
+/// Commands in a SPOP run.
+///
+/// Under the fixture with room to spare, because a run that reaches the bottom
+/// stops being a SPOP benchmark at the moment it gets there and the rest of the
+/// row is the server saying the set is empty at whatever rate it says that.
+const POP_RUN: u64 = 3_000_000;
+
+/// Members in the set SRANDMEMBER draws from.
+const RAND_MEMBERS: u64 = 1_000_000;
+
+/// Members in each of the two sets the algebra rows work on.
+///
+/// A thousand and not a million. SINTER over two million member sets is one
+/// command a second, which is a real thing servers do and is not a throughput
+/// row: the gate wants to know what set algebra costs per command against a
+/// rival, and at a thousand members that question has an answer both ends of
+/// the comparison can produce a few hundred thousand of.
+const ALGEBRA_MEMBERS: u64 = 1_000;
+
+/// How many of those two sets are the same member.
+const ALGEBRA_SHARED: u64 = 500;
+
+const POP_FIXTURE: [Fixture; 1] = [Fixture {
+    key: "set:pop",
+    from: 1,
+    members: POP_MEMBERS,
+}];
+
+const RAND_FIXTURE: [Fixture; 1] = [Fixture {
+    key: "set:rand",
+    from: 1,
+    members: RAND_MEMBERS,
+}];
+
+const ALGEBRA_FIXTURE: [Fixture; 2] = [
+    Fixture {
+        key: "set:a",
+        from: 1,
+        members: ALGEBRA_MEMBERS,
+    },
+    Fixture {
+        key: "set:b",
+        from: ALGEBRA_MEMBERS - ALGEBRA_SHARED + 1,
+        members: ALGEBRA_MEMBERS,
+    },
+];
 
 impl Op {
     /// The name `redis-benchmark -t` knows it by.
@@ -64,11 +166,53 @@ impl Op {
             Op::Incr => "incr",
             Op::Mset => "mset",
             Op::Sadd => "sadd",
+            Op::Spop => "spop",
+            Op::Srandmember => "srandmember",
+            Op::Sinter => "sinter",
+            Op::Sunion => "sunion",
             // The multi bulk form and not the inline one, because inline PING
             // is a different number of bytes on the wire and no real client
             // sends it.
             Op::Ping => "ping_mbulk",
         }
+    }
+
+    /// What has to be in the database before this command means anything.
+    ///
+    /// Empty for most of them, because most of them build their own keys as
+    /// they go. The set reads do not, and a SPOP against a key that is not
+    /// there is a null reply at whatever rate the server can produce nulls.
+    pub fn fixtures(self) -> &'static [Fixture] {
+        match self {
+            Op::Spop => &POP_FIXTURE,
+            Op::Srandmember => &RAND_FIXTURE,
+            Op::Sinter | Op::Sunion => &ALGEBRA_FIXTURE,
+            _ => &[],
+        }
+    }
+
+    /// How many commands a run is, when the fixture and not the clock decides.
+    ///
+    /// Only SPOP, and only because it consumes what it reads. Everything else
+    /// is calibrated by probing until the run lasts [`Plan::min_seconds`], and
+    /// probing a draining op would empty the set before the measured pass
+    /// started.
+    pub fn fixed_requests(self) -> Option<u64> {
+        match self {
+            Op::Spop => Some(POP_RUN),
+            _ => None,
+        }
+    }
+
+    /// Whether a run of this leaves the database in a state the next run cannot
+    /// use.
+    ///
+    /// A draining op gets its fixture rebuilt before every pass, and gets no
+    /// warmup pass at all, because the fixture build is millions of writes
+    /// against the same server and is a better warmup than a tenth of the run
+    /// would have been.
+    pub fn drains(self) -> bool {
+        self == Op::Spop
     }
 }
 
@@ -80,6 +224,10 @@ impl fmt::Display for Op {
             Op::Incr => "INCR",
             Op::Mset => "MSET",
             Op::Sadd => "SADD",
+            Op::Spop => "SPOP",
+            Op::Srandmember => "SRANDMEMBER",
+            Op::Sinter => "SINTER",
+            Op::Sunion => "SUNION",
             Op::Ping => "PING",
         })
     }
@@ -115,8 +263,21 @@ impl Driver {
     /// placeholder expands to the same key everywhere in one command, so an
     /// MSET built that way writes one key ten times and is not an MSET. That
     /// row comes from `redis-benchmark` only, and the report says so.
+    ///
+    /// It goes the other way for anything with a fixture. `redis-benchmark` has
+    /// a `-t spop` and it is not usable here: it pops from a key its own `-t
+    /// sadd` test fills, so run on its own it pops from a set that is not there
+    /// and reports how fast the server can say so. Building the fixture with
+    /// memtier and reading it with `redis-benchmark` is worse, because the two
+    /// name members differently and it would be a hundred percent miss rate
+    /// dressed up as a benchmark. So the fixture rows are memtier only, which
+    /// is the same rule as MSET pointed the other way: a generator gets a row
+    /// when it can set the row up as well as send it.
     pub fn can_run(self, op: Op) -> bool {
-        !(self == Driver::Memtier && op == Op::Mset)
+        match self {
+            Driver::RedisBenchmark => op.fixtures().is_empty(),
+            Driver::Memtier => op != Op::Mset,
+        }
     }
 }
 
@@ -243,7 +404,7 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// The gate plan: five commands, two generators, two pipeline depths.
+    /// The gate plan: nine commands, two generators, two pipeline depths.
     ///
     /// The numbers are the ones the methodology fixes. 64 byte values because
     /// the default of 3 measures the protocol and nothing else. A keyspace of
@@ -266,7 +427,17 @@ impl Plan {
             }
         }
         for pipeline in [1, 16] {
-            for op in [Op::Set, Op::Get, Op::Incr, Op::Mset, Op::Sadd] {
+            for op in [
+                Op::Set,
+                Op::Get,
+                Op::Incr,
+                Op::Mset,
+                Op::Sadd,
+                Op::Spop,
+                Op::Srandmember,
+                Op::Sinter,
+                Op::Sunion,
+            ] {
                 for driver in [Driver::RedisBenchmark, Driver::Memtier] {
                     if driver.can_run(op) {
                         cases.push(Case {
@@ -310,9 +481,13 @@ impl Plan {
     /// The starting point, and also what a run that skips calibration gets. A
     /// zero here would be a plan that measures nothing, so it is set once when
     /// the plan is built rather than left to whoever calls it.
+    ///
+    /// A case whose op has a fixed count keeps it. That count is the one thing
+    /// about the run that is not a tuning knob: it comes out of the size of the
+    /// fixture, and raising it past the fixture would measure the empty set.
     pub fn size_cases(&mut self, requests: u64) {
         for c in &mut self.cases {
-            c.requests = requests;
+            c.requests = c.op.fixed_requests().unwrap_or(requests);
         }
     }
 
@@ -349,5 +524,67 @@ impl Plan {
         plan.repeats = 1;
         plan.warmup = false;
         plan
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The point of spelling ranges out instead of counts. If these two sets
+    /// stopped overlapping, SINTER would still run, still produce a number, and
+    /// that number would be the rate at which a server returns the empty array.
+    /// It is the failure that looks most like a result.
+    #[test]
+    fn the_two_algebra_sets_share_exactly_what_they_are_meant_to() {
+        let [a, b] = ALGEBRA_FIXTURE;
+        let shared = a.to().min(b.to()).saturating_sub(a.from.max(b.from)) + 1;
+        assert_eq!(shared, ALGEBRA_SHARED);
+        assert_ne!(a.key, b.key);
+        assert!(shared < a.members, "an overlap, not one set twice");
+    }
+
+    /// The one invariant SPOP has. A run longer than the fixture reaches the
+    /// bottom partway through and spends the rest of itself measuring how fast
+    /// the server says the set is empty, which is faster than a pop and drags
+    /// the row upward.
+    #[test]
+    fn a_pop_run_cannot_reach_the_bottom_of_its_fixture() {
+        let run = Op::Spop.fixed_requests().expect("SPOP has a fixed count");
+        let held: u64 = Op::Spop.fixtures().iter().map(|f| f.members).sum();
+        // Fixtures are filled by random draw and land about 99.3 percent full,
+        // so the margin has to be more than a rounding one.
+        assert!(run < held * 9 / 10, "{run} pops out of {held} members");
+    }
+
+    /// A generator gets a row when it can set the row up as well as send it.
+    #[test]
+    fn only_memtier_drives_the_rows_that_need_a_fixture() {
+        for op in [Op::Spop, Op::Srandmember, Op::Sinter, Op::Sunion] {
+            assert!(!op.fixtures().is_empty(), "{op} is a fixture row");
+            assert!(!Driver::RedisBenchmark.can_run(op), "{op}");
+            assert!(Driver::Memtier.can_run(op), "{op}");
+        }
+        // And the rule did not quietly take the old rows out with it.
+        for op in [Op::Set, Op::Get, Op::Incr, Op::Sadd, Op::Ping] {
+            assert!(Driver::RedisBenchmark.can_run(op), "{op}");
+            assert!(Driver::Memtier.can_run(op), "{op}");
+        }
+        assert!(Driver::RedisBenchmark.can_run(Op::Mset));
+        assert!(!Driver::Memtier.can_run(Op::Mset));
+    }
+
+    /// Calibration is for ops whose run length is a question. SPOP's is not,
+    /// and a calibration pass that raised it would walk it past the fixture.
+    #[test]
+    fn sizing_leaves_the_fixed_counts_alone() {
+        let mut plan = Plan::gate(Vec::new(), "redis-benchmark".into(), "memtier".into());
+        plan.size_cases(50_000_000);
+        for c in &plan.cases {
+            match c.op.fixed_requests() {
+                Some(n) => assert_eq!(c.requests, n, "{}", c.op),
+                None => assert_eq!(c.requests, 50_000_000, "{}", c.op),
+            }
+        }
     }
 }
