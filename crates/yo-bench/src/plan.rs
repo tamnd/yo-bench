@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-/// One of the four commands the M2 gate is written against.
+/// One of the commands a gate is written against.
 ///
 /// The set is small because the gate is small. A milestone that ships hashes
 /// adds hashes here, and the row it produces has the same shape as these.
@@ -37,6 +37,22 @@ pub enum Op {
     /// reader gets when they run the tool themselves is worse than a number
     /// that needs a sentence of explanation.
     Mset,
+    /// Add one member to one set.
+    ///
+    /// The hot key row. Both generators send it against a single key for the
+    /// whole run with a member drawn at random out of the keyspace, so every
+    /// connection is contending for the same record and there is no spread to
+    /// exploit. That is the shape aki came in at 0.82x on and the shape the M3
+    /// gate is written against.
+    ///
+    /// The other four set commands the M3 gate wants are not here yet, and the
+    /// reason is the fixture rather than the plumbing. SPOP, SRANDMEMBER,
+    /// SINTER and SUNION all need a set that already has members in it, and a
+    /// ten second SPOP run at two million a second would drain a million member
+    /// set in half a second and spend the rest of the run measuring how fast a
+    /// server can say the set is empty. Sizing that fill is its own piece of
+    /// work and it gets its own change.
+    Sadd,
 }
 
 impl Op {
@@ -47,6 +63,7 @@ impl Op {
             Op::Get => "get",
             Op::Incr => "incr",
             Op::Mset => "mset",
+            Op::Sadd => "sadd",
             // The multi bulk form and not the inline one, because inline PING
             // is a different number of bytes on the wire and no real client
             // sends it.
@@ -62,6 +79,7 @@ impl fmt::Display for Op {
             Op::Get => "GET",
             Op::Incr => "INCR",
             Op::Mset => "MSET",
+            Op::Sadd => "SADD",
             Op::Ping => "PING",
         })
     }
@@ -225,7 +243,7 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// The M2 gate plan: four commands, two generators, two pipeline depths.
+    /// The gate plan: five commands, two generators, two pipeline depths.
     ///
     /// The numbers are the ones the methodology fixes. 64 byte values because
     /// the default of 3 measures the protocol and nothing else. A keyspace of
@@ -248,7 +266,7 @@ impl Plan {
             }
         }
         for pipeline in [1, 16] {
-            for op in [Op::Set, Op::Get, Op::Incr, Op::Mset] {
+            for op in [Op::Set, Op::Get, Op::Incr, Op::Mset, Op::Sadd] {
                 for driver in [Driver::RedisBenchmark, Driver::Memtier] {
                     if driver.can_run(op) {
                         cases.push(Case {

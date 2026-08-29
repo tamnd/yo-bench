@@ -208,6 +208,15 @@ fn memtier_args(op: Op, plan: &Plan, pipeline: u32, requests: u64) -> (String, V
             args.push("--command=INCR __key__".into());
             args.push("--command-key-pattern=R".into());
         }
+        // One literal key for the whole run and the random one as the member,
+        // which is the same shape `redis-benchmark -t sadd` sends: it writes
+        // `SADD myset:{tag} element:__rand_int__`, one key with a member out of
+        // the keyspace. The key pattern still applies, because it governs
+        // `__key__` and not the position it appears in.
+        Op::Sadd => {
+            args.push("--command=SADD myset __key__".into());
+            args.push("--command-key-pattern=R".into());
+        }
         // No key in it, so no key pattern either. Passing one is the error
         // described above rather than a setting that does nothing.
         Op::Ping => args.push("--command=PING".into()),
@@ -365,6 +374,28 @@ mod tests {
         let (_, mt) = memtier_args(Op::Get, &plan, 1, 1000);
         assert_eq!(window(&mt, "-S"), Some("/tmp/yobench.sock"));
         assert!(!mt.iter().any(|a| a == "-s" || a == "-p"), "{mt:?}");
+    }
+
+    /// The two generators have to send the same shape or the row is two
+    /// different benchmarks sharing a name. Both send one literal key for the
+    /// whole run with the random draw as the member, which is what makes this
+    /// the hot key row rather than another spread write.
+    #[test]
+    fn both_generators_send_sadd_at_one_key_with_a_random_member() {
+        let plan = Plan::smoke(Vec::new(), "redis-benchmark".into(), "memtier".into());
+
+        let (_, rb) = redis_benchmark_args(Op::Sadd, &plan, 1, 1000);
+        assert_eq!(window(&rb, "-t"), Some("sadd"));
+
+        let (_, mt) = memtier_args(Op::Sadd, &plan, 1, 1000);
+        assert!(
+            mt.iter().any(|a| a == "--command=SADD myset __key__"),
+            "{mt:?}"
+        );
+        assert!(mt.iter().any(|a| a == "--command-key-pattern=R"), "{mt:?}");
+        // The other spelling is an error and not a duplicate, and it kills the
+        // run an hour in rather than at the start.
+        assert!(!mt.iter().any(|a| a.starts_with("--key-pattern")), "{mt:?}");
     }
 
     /// The value that follows a flag, or None if the flag is not there.
