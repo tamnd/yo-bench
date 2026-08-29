@@ -407,6 +407,38 @@ impl Report {
             }
         }
 
+        // The set rows are not sized the way every other row is sized, and a
+        // reader who sees a two second run next to a ten second one deserves to
+        // be told why here rather than have to work it out from the elapsed
+        // column.
+        if p.cases.iter().any(|c| !c.op.fixtures().is_empty()) {
+            let mut said = std::collections::BTreeSet::new();
+            let mut fixtures = Vec::new();
+            for c in &p.cases {
+                for f in c.op.fixtures() {
+                    if said.insert(f.key) {
+                        fixtures.push(format!("{} holds {} members", f.key, f.members));
+                    }
+                }
+            }
+            let _ = writeln!(
+                s,
+                "The set read rows run against keys built before the run rather than by it, and they are memtier rows only, because a generator gets a row here when it can set the row up as well as send it. The fixtures are: {}. Members are put in by random draw over a fixed range, so a fixture lands about 99.3 percent full and two fixtures share exactly as much as their ranges overlap.\n",
+                fixtures.join(", ")
+            );
+            if let Some(c) = p
+                .cases
+                .iter()
+                .find(|c| c.op.drains() && c.op.fixed_requests().is_some())
+            {
+                let _ = writeln!(
+                    s,
+                    "The {} rows are the exception to the ten second rule and run a fixed {} commands instead. The run consumes what it reads, so it cannot be calibrated by probing and it cannot be stretched: a run long enough to reach the bottom of the fixture would spend the rest of itself measuring how fast a server says the set is empty, which is faster than a pop and would drag the row upward. The fixture is rebuilt before every pass. Those rows are shorter than the others and the elapsed column says how much shorter, which is honest here because memtier reports its own elapsed time and does not round it to a quarter second the way redis-benchmark does.\n",
+                    c.op, c.requests
+                );
+            }
+        }
+
         let _ = writeln!(s, "## Under test\n");
         for t in &p.targets {
             let _ = writeln!(

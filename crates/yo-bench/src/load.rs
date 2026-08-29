@@ -11,7 +11,7 @@
 use std::io;
 use std::process::Command;
 
-use crate::plan::{Driver, Op, Plan};
+use crate::plan::{Driver, Fixture, Op, Plan};
 
 /// What one measured run produced.
 #[derive(Debug, Clone)]
@@ -50,16 +50,40 @@ pub fn run(
         Driver::RedisBenchmark => redis_benchmark_args(op, plan, pipeline, requests),
         Driver::Memtier => memtier_args(op, plan, pipeline, requests),
     };
+    let (stdout, seconds, cmdline) = exec(&prog, &args, plan, quiet)?;
 
+    let mut sample = match driver {
+        Driver::RedisBenchmark => parse_redis_benchmark(&stdout, op),
+        Driver::Memtier => parse_memtier(&stdout),
+    }
+    .map_err(|e| io::Error::other(format!("{prog}: {e}\n--- output ---\n{stdout}")))?;
+    sample.cmdline = cmdline;
+    sample.seconds = seconds;
+    Ok(sample)
+}
+
+/// Run a generator and hand back what it said, how long it took and what it was
+/// asked.
+///
+/// The wall clock is taken around the whole process, so it includes the
+/// generator's own startup and is an overestimate by a few milliseconds. That is
+/// the harmless direction for deciding whether a run was long enough to mean
+/// anything.
+fn exec(
+    prog: &str,
+    args: &[String],
+    plan: &Plan,
+    quiet: bool,
+) -> io::Result<(String, f64, String)> {
     let mut cmd = match &plan.load_cpus {
         Some(cpus) => {
             let mut c = Command::new("taskset");
-            c.arg("-c").arg(cpus).arg(&prog).args(&args);
+            c.arg("-c").arg(cpus).arg(prog).args(args);
             c
         }
         None => {
-            let mut c = Command::new(&prog);
-            c.args(&args);
+            let mut c = Command::new(prog);
+            c.args(args);
             c
         }
     };
@@ -73,23 +97,14 @@ pub fn run(
     let out = cmd.output()?;
     let seconds = began.elapsed().as_secs_f64();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     if !out.status.success() {
         return Err(io::Error::other(format!(
             "{prog} exited {}: {}",
             out.status,
-            stderr.trim()
+            String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-
-    let mut sample = match driver {
-        Driver::RedisBenchmark => parse_redis_benchmark(&stdout, op),
-        Driver::Memtier => parse_memtier(&stdout),
-    }
-    .map_err(|e| io::Error::other(format!("{prog}: {e}\n--- output ---\n{stdout}\n{stderr}")))?;
-    sample.cmdline = cmdline;
-    sample.seconds = seconds;
-    Ok(sample)
+    Ok((stdout, seconds, cmdline))
 }
 
 /// The generator's own command line for filling the keyspace before a read run.
@@ -110,6 +125,71 @@ pub fn preload(driver: Driver, plan: &Plan, quiet: bool) -> io::Result<()> {
         eprintln!("    filling {} keys", plan.keyspace);
     }
     run(driver, Op::Set, plan, 64, requests, quiet).map(|_| ())
+}
+
+/// Put the members of one [`Fixture`] into the server.
+///
+/// memtier and not `redis-benchmark`, always, for the reason `Driver::can_run`
+/// gives: the member names have to match what the measured run asks for and the
+/// two generators name things differently. Every row that needs a fixture is a
+/// memtier row, so there is one namer and no way to mix them up.
+///
+/// Pipeline 64 because this is setup and nobody is timing it. Five draws per
+/// member for the 99.3 percent coverage the doc on `Fixture` describes, with a
+/// floor so that the small algebra sets, where five times a thousand is five
+/// thousand requests and takes no time at all, come out complete rather than
+/// approximately complete.
+pub fn build(plan: &Plan, fx: &Fixture, quiet: bool) -> io::Result<()> {
+    if !quiet {
+        eprintln!("    building {} with {} members", fx.key, fx.members);
+    }
+    let (prog, args) = fixture_args(plan, fx);
+    exec(&prog, &args, plan, quiet).map(|_| ())
+}
+
+fn fixture_args(plan: &Plan, fx: &Fixture) -> (String, Vec<String>) {
+    let requests = fx.members.saturating_mul(5).max(100_000);
+    let per_thread = (plan.clients / plan.threads).max(1);
+    let conns = per_thread * plan.threads;
+    let per_conn = (requests / u64::from(conns)).max(1);
+
+    let mut args = memtier_where(plan);
+    args.extend([
+        "-P".into(),
+        "redis".into(),
+        "-t".into(),
+        plan.threads.to_string(),
+        "-c".into(),
+        per_thread.to_string(),
+        "-n".into(),
+        per_conn.to_string(),
+        "--pipeline=64".into(),
+        format!("--key-minimum={}", fx.from),
+        format!("--key-maximum={}", fx.to()),
+        "--hide-histogram".into(),
+        "--distinct-client-seed".into(),
+        format!("--command=SADD {} __key__", fx.key),
+        "--command-key-pattern=R".into(),
+    ]);
+    (plan.memtier.clone(), args)
+}
+
+/// Where memtier should connect, and never both ways at once.
+///
+/// memtier spells the socket file `-S` and the host `-s`. Passing a host and a
+/// socket together is not an error and the socket wins, which is exactly the
+/// kind of thing that produces a report labelled one way and measured the
+/// other, so only one of them is ever built.
+fn memtier_where(plan: &Plan) -> Vec<String> {
+    match &plan.socket {
+        Some(path) => vec!["-S".into(), path.clone()],
+        None => vec![
+            "-s".into(),
+            "127.0.0.1".into(),
+            "-p".into(),
+            plan.port.to_string(),
+        ],
+    }
 }
 
 fn redis_benchmark_args(
@@ -159,17 +239,7 @@ fn memtier_args(op: Op, plan: &Plan, pipeline: u32, requests: u64) -> (String, V
     let conns = per_thread * plan.threads;
     let per_conn = (requests / u64::from(conns)).max(1);
 
-    // memtier spells it `-S`, and its `-s` is the host. Same rule as above:
-    // one transport per run and never both on the command line.
-    let mut args = match &plan.socket {
-        Some(path) => vec!["-S".into(), path.clone()],
-        None => vec![
-            "-s".into(),
-            "127.0.0.1".into(),
-            "-p".into(),
-            plan.port.to_string(),
-        ],
-    };
+    let mut args = memtier_where(plan);
     args.extend([
         "-P".into(),
         "redis".into(),
@@ -217,6 +287,13 @@ fn memtier_args(op: Op, plan: &Plan, pipeline: u32, requests: u64) -> (String, V
             args.push("--command=SADD myset __key__".into());
             args.push("--command-key-pattern=R".into());
         }
+        // The fixture rows name their keys literally and take no argument out
+        // of the keyspace, so like PING they get no key pattern. The keys have
+        // to be the ones `Op::fixtures` builds or the row measures a miss.
+        Op::Spop => args.push("--command=SPOP set:pop".into()),
+        Op::Srandmember => args.push("--command=SRANDMEMBER set:rand".into()),
+        Op::Sinter => args.push("--command=SINTER set:a set:b".into()),
+        Op::Sunion => args.push("--command=SUNION set:a set:b".into()),
         // No key in it, so no key pattern either. Passing one is the error
         // described above rather than a setting that does nothing.
         Op::Ping => args.push("--command=PING".into()),
@@ -396,6 +473,72 @@ mod tests {
         // The other spelling is an error and not a duplicate, and it kills the
         // run an hour in rather than at the start.
         assert!(!mt.iter().any(|a| a.starts_with("--key-pattern")), "{mt:?}");
+    }
+
+    /// The test that earns its keep. A fixture builds `set:pop` and the
+    /// measured run sends `SPOP set:pop`, and those two strings live in
+    /// different files. Let them drift by one character and the run pops from a
+    /// key that is not there, which does not fail, does not warn, and comes back
+    /// faster than the real thing because a null reply is cheaper than a member.
+    /// The row would be published as a set benchmark and would be a benchmark of
+    /// missing keys.
+    #[test]
+    fn every_fixture_row_asks_for_the_keys_its_fixtures_build() {
+        let plan = Plan::smoke(Vec::new(), "redis-benchmark".into(), "memtier".into());
+        for op in [Op::Spop, Op::Srandmember, Op::Sinter, Op::Sunion] {
+            let (_, args) = memtier_args(op, &plan, 1, 1000);
+            let command = args
+                .iter()
+                .find(|a| a.starts_with("--command="))
+                .unwrap_or_else(|| panic!("{op} sends a command"));
+            let sent: Vec<&str> = command
+                .trim_start_matches("--command=")
+                .split_whitespace()
+                .skip(1)
+                .collect();
+            let built: Vec<&str> = op.fixtures().iter().map(|f| f.key).collect();
+            assert_eq!(sent, built, "{op} reads {sent:?} and builds {built:?}");
+        }
+    }
+
+    /// The fixture builder is memtier writing SADD over a range, and the range
+    /// is the whole point: it is what decides how much two sets share.
+    #[test]
+    fn a_fixture_is_built_over_the_range_it_names() {
+        let plan = Plan::smoke(Vec::new(), "redis-benchmark".into(), "memtier".into());
+        let fx = Fixture {
+            key: "set:a",
+            from: 501,
+            members: 1_000,
+        };
+        let args = fixture_args(&plan, &fx).1;
+        assert!(args.iter().any(|a| a == "--key-minimum=501"), "{args:?}");
+        assert!(args.iter().any(|a| a == "--key-maximum=1500"), "{args:?}");
+        assert!(
+            args.iter().any(|a| a == "--command=SADD set:a __key__"),
+            "{args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "--command-key-pattern=R"),
+            "{args:?}"
+        );
+        // Same trap as the measured rows: memtier refuses to be given both
+        // spellings and dies with a usage message rather than a warning.
+        assert!(
+            !args.iter().any(|a| a.starts_with("--key-pattern")),
+            "{args:?}"
+        );
+    }
+
+    /// A fixture goes over whichever transport the run is using, or it fills a
+    /// server the measured pass is not talking to.
+    #[test]
+    fn a_fixture_follows_the_run_onto_the_socket_file() {
+        let mut plan = Plan::smoke(Vec::new(), "redis-benchmark".into(), "memtier".into());
+        plan.socket = Some("/tmp/yobench.sock".into());
+        let args = fixture_args(&plan, &Op::Spop.fixtures()[0]).1;
+        assert_eq!(window(&args, "-S"), Some("/tmp/yobench.sock"));
+        assert!(!args.iter().any(|a| a == "-s" || a == "-p"), "{args:?}");
     }
 
     /// The value that follows a flag, or None if the flag is not there.
