@@ -32,7 +32,7 @@ usage:
   yobench <plan> [options]
 
 plans:
-  gate     the M2 plan: SET, GET, INCR and MSET, two generators, pipeline 1 and 16
+  gate     SET, GET, INCR, MSET and the five set commands, two generators, pipeline 1 and 16
   smoke    three cases and a tenth of the load, for checking the rig works
 
 options:
