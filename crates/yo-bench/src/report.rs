@@ -81,6 +81,14 @@ const TICK: f64 = 0.25;
 ///
 /// Eighty five percent, which is the number section 4.1 uses, kept the same
 /// here rather than picked again.
+///
+/// This bar applies to the rows the argument above is actually about, which is
+/// the ones where the round trip is most of the time. It used to apply to every
+/// row that had a `PING` beside it, and that scored `SINTER` over two thousand
+/// members a fail at two percent of the ceiling while it was beating Redis by
+/// 2.28x. Sixteen microseconds of set intersection is not a row the transport
+/// is holding back, and a bar it can never reach at any engine speed is not a
+/// bar, it is a constant. See [`Verdict::transport_bound`].
 const CEILING_SHARE: f64 = 0.85;
 
 /// How far apart the servers' `PING` numbers can be before the report says so.
@@ -107,6 +115,33 @@ fn work_ns(ops: f64, ping: Option<f64>) -> Option<f64> {
         return None;
     }
     Some(1e9 / ops - 1e9 / ping)
+}
+
+/// Which bar a row was held to.
+///
+/// Named in the report rather than left implicit, because the two bars are not
+/// comparable and a table that mixes them without saying which is which reads as
+/// though every fail is the same distance from passing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Bar {
+    /// The round trip is most of the row. Scored as a share of this `PING`.
+    Ceiling(f64),
+    /// The engine is most of the row. Scored on this work ratio against ten.
+    Work(f64),
+    /// No `PING` was measured on this generator and depth. Scored on throughput
+    /// against ten, which is the bar the milestone is written in.
+    Throughput,
+}
+
+impl Bar {
+    /// One word for the table column.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Bar::Ceiling(_) => "ceiling",
+            Bar::Work(_) => "work",
+            Bar::Throughput => "ratio",
+        }
+    }
 }
 
 /// A key that identifies a case across targets.
@@ -166,13 +201,60 @@ impl Verdict {
         if self.our_peak_kb > self.best_rival_peak_kb {
             return false;
         }
-        match self.ceiling {
-            // A row with a ceiling on it is scored against the ceiling and the
-            // ratio is context. Nothing about the tick matters here: the bar is
-            // a share of a number measured on the same generator at the same
+        match self.bar() {
+            // A transport bound row is scored against the ceiling and the ratio
+            // is context. Nothing about the tick matters here: the bar is a
+            // share of a number measured on the same generator at the same
             // depth, so both sides carry the same rounding.
-            Some(c) => self.ours >= CEILING_SHARE * c,
-            None => !self.unresolved && self.ratio >= 10.0,
+            Bar::Ceiling(c) => self.ours >= CEILING_SHARE * c,
+            // A work bound row is scored on what the command cost the server
+            // with the transport taken out, because the transport is the part
+            // both sides pay the same and it is not what is being compared. On
+            // a row where the engine is most of the time this is very close to
+            // the throughput ratio anyway, and where it is not, it is the
+            // throughput ratio that is wrong.
+            Bar::Work(ratio) => ratio >= 10.0,
+            Bar::Throughput => !self.unresolved && self.ratio >= 10.0,
+        }
+    }
+
+    /// Is the round trip most of what this row measured.
+    ///
+    /// The ceiling bar rests on one claim: both servers pay for the same round
+    /// trip and the round trip is nearly all of it, so a ten times throughput
+    /// ratio is arithmetically unavailable no matter how fast the engine gets.
+    /// That claim is true of `GET` and false of `SUNION`, and the difference is
+    /// measurable rather than a matter of opinion: compare what the command cost
+    /// the server against what one round trip costs at this depth, which is the
+    /// period of the `PING` that set the ceiling.
+    ///
+    /// Under it, the engine cannot be more than half the time and the ceiling is
+    /// the right bar. Over it, the engine is the majority of the row, a ten times
+    /// win is available in principle, and the number that says how far away it is
+    /// is the work ratio.
+    ///
+    /// `None` when there is no work number to compare, which is a row that came
+    /// out at or above its own `PING`. That is a command lost in the noise of the
+    /// transport, so it is transport bound by definition.
+    fn transport_bound(&self) -> bool {
+        let (Some(ceiling), Some(work)) = (self.ceiling, self.our_work_ns()) else {
+            return true;
+        };
+        work < 1e9 / ceiling
+    }
+
+    /// Which bar this row is held to, and the number it is held to it with.
+    pub fn bar(&self) -> Bar {
+        match self.ceiling {
+            Some(c) if self.transport_bound() => Bar::Ceiling(c),
+            Some(_) => match self.work_ratio() {
+                Some(r) => Bar::Work(r),
+                // Work bound by our own number but with no rival work to divide
+                // by, which is a rival that came out at or above its own `PING`.
+                // Nothing to compare, so fall back rather than invent one.
+                None => Bar::Throughput,
+            },
+            None => Bar::Throughput,
         }
     }
 
@@ -211,9 +293,9 @@ impl Verdict {
     /// How many times cheaper the command is on our side, transport removed.
     ///
     /// Above one means we spend less per command than the rival does. This is
-    /// the closest thing the wire has to the in process number, and it is
-    /// reported rather than gated, because what a client actually gets is the
-    /// throughput column and not this one.
+    /// the closest thing the wire has to the in process number. On a row where
+    /// the engine is most of the time it is the bar, and on a row where the
+    /// transport is it is context, which is the split [`Verdict::bar`] makes.
     pub fn work_ratio(&self) -> Option<f64> {
         match (self.our_work_ns(), self.rival_work_ns()) {
             (Some(ours), Some(theirs)) if ours > 0.0 => Some(theirs / ours),
@@ -225,7 +307,7 @@ impl Verdict {
     pub fn verdict(&self) -> &'static str {
         if self.passes() {
             "pass"
-        } else if self.ceiling.is_none() && self.unresolved {
+        } else if self.bar() == Bar::Throughput && self.unresolved {
             "unresolved"
         } else {
             "fail"
@@ -481,24 +563,36 @@ impl Report {
         let _ = writeln!(s, "## Against the best rival\n");
         let _ = writeln!(
             s,
-            "The ratio is ours over the faster of Redis and Valkey on the same row, and the memory column is ours against the leaner of the two. The share column is ours over the PING ceiling for the same generator at the same pipeline depth, and where there is one it is the verdict: a row passes at {:.0} percent of the ceiling and no worse on memory. Where there is no ceiling the old bar applies, ten times the best rival and no worse on memory.\n",
+            "The ratio is ours over the faster of Redis and Valkey on the same row, and the memory column is ours against the leaner of the two. No row passes on memory it lost, whichever bar scored it.\n"
+        );
+        let _ = writeln!(
+            s,
+            "The two work columns are the same rows with the transport taken out: ours over this row minus ours over our own PING on the same generator and depth, in nanoseconds, and the same subtraction on the rival's side against its own PING. That is what the command cost the server once getting it off the wire is paid for.\n"
+        );
+        let _ = writeln!(
+            s,
+            "The bar column says which of two bars scored the row, and they are picked by comparing our work column against one round trip at this depth, which is the period of the PING that set the ceiling.\n"
+        );
+        let _ = writeln!(
+            s,
+            "**ceiling**, when the command cost less than a round trip. Both servers pay for the same round trip and it is most of the row, so a ten times throughput ratio is not available at any engine speed and it is not a bar. The row is scored as a share of the ceiling instead, and it passes at {:.0} percent.\n",
             CEILING_SHARE * 100.0
         );
         let _ = writeln!(
             s,
-            "A row marked unresolved is one redis-benchmark could not tell apart. It ends a run on a 250 millisecond timer tick and divides the request count by the clock it read there, so two servers that finished within a tick of each other come out on exactly the same number. The ratio on such a row is an artifact and means nothing. Runs are sized in a calibration pass to be long enough that this does not happen, so a row marked here is one where the sizing was overridden or the calibration was wrong. Only rows scored on the ratio can be unresolved, because the ceiling bar does not compare two servers.\n"
+            "**work**, when the command cost more than a round trip. The engine is the majority of the row, ten times is available, and the number that says how far away it is is the work ratio rather than the throughput ratio, because the throughput ratio is diluted by a transport both sides pay equally. This is the bar the set operations are on, and it is the one that used to be missing: SINTER beating Redis by 2.28x was scored a fail at two percent of a PING ceiling it could never approach, which said nothing about SINTER and everything about the arithmetic.\n"
         );
         let _ = writeln!(
             s,
-            "The two work columns are the same rows with the transport taken out: ours over this row minus ours over our own PING on the same generator and depth, in nanoseconds, and the same subtraction on the rival's side against its own PING. That is what the command cost the server once getting it off the wire is paid for. It is reported and not gated, because what a client gets is the throughput column, but it is the number that says whether a row that missed the ceiling missed it on the engine or on the socket.\n"
+            "A row marked unresolved is one redis-benchmark could not tell apart. It ends a run on a 250 millisecond timer tick and divides the request count by the clock it read there, so two servers that finished within a tick of each other come out on exactly the same number. The ratio on such a row is an artifact and means nothing. Runs are sized in a calibration pass to be long enough that this does not happen, so a row marked here is one where the sizing was overridden or the calibration was wrong.\n"
         );
         let _ = writeln!(
             s,
-            "| command | generator | pipeline | yo ops/sec | best rival | rival ops/sec | ratio | share | yo work ns | rival work ns | yo peak MiB | rival peak MiB | verdict |"
+            "| command | generator | pipeline | yo ops/sec | best rival | rival ops/sec | ratio | share | yo work ns | rival work ns | work ratio | yo peak MiB | rival peak MiB | bar | verdict |"
         );
         let _ = writeln!(
             s,
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
         );
         let verdicts = self.verdicts();
         for v in &verdicts {
@@ -512,7 +606,7 @@ impl Report {
             };
             let _ = writeln!(
                 s,
-                "| {} | {} | {} | {} | {} | {} | {:.2}x | {} | {} | {} | {:.1} | {:.1} | {} |",
+                "| {} | {} | {} | {} | {} | {} | {:.2}x | {} | {} | {} | {} | {:.1} | {:.1} | {} | {} |",
                 v.case.op,
                 v.case.driver,
                 v.case.pipeline,
@@ -523,8 +617,13 @@ impl Report {
                 share,
                 ns(v.our_work_ns()),
                 ns(v.rival_work_ns()),
+                match v.work_ratio() {
+                    Some(r) => format!("{r:.2}x"),
+                    None => "-".to_string(),
+                },
                 mib(v.our_peak_kb),
                 mib(v.best_rival_peak_kb),
+                v.bar().name(),
                 v.verdict(),
             );
         }
@@ -533,9 +632,16 @@ impl Report {
         let passed = verdicts.iter().filter(|v| v.passes()).count();
         let bound = verdicts
             .iter()
-            .filter(|v| v.ceiling.is_none() && v.unresolved)
+            .filter(|v| v.bar() == Bar::Throughput && v.unresolved)
             .count();
-        let on_ceiling = verdicts.iter().filter(|v| v.ceiling.is_some()).count();
+        let on_ceiling = verdicts
+            .iter()
+            .filter(|v| matches!(v.bar(), Bar::Ceiling(_)))
+            .count();
+        let on_work = verdicts
+            .iter()
+            .filter(|v| matches!(v.bar(), Bar::Work(_)))
+            .count();
         // The worst ratio is over the rows that measured something. Including
         // an unresolved row would put a 1.00x in the summary line that no
         // server earned.
@@ -553,7 +659,7 @@ impl Report {
         } else {
             let _ = writeln!(
                 s,
-                "{passed} of {} cases pass, {on_ceiling} of them against the ceiling and the rest against the ratio. The worst ratio on a row that measured a server is {worst:.2}x.",
+                "{passed} of {} cases pass. {on_ceiling} were held to the ceiling because the round trip was most of the row, {on_work} to the work ratio because the engine was, and the rest to the throughput ratio because there was no PING beside them. The worst throughput ratio on a row that measured a server is {worst:.2}x.",
                 verdicts.len()
             );
             if bound > 0 {
@@ -1007,6 +1113,101 @@ mod tests {
         // column exists to put in context: a fail on the ceiling and a win on
         // the command.
         assert!(!v.passes());
+    }
+
+    /// A row on the same generator and depth as a PING, at a chosen rate.
+    ///
+    /// The set operation rows below need a case that is not `SET` at pipeline 1,
+    /// because that is the shape every other test in this file already builds
+    /// and reusing it would hide which rate produced which verdict.
+    fn paired(op: Op, pipeline: u32, ours: f64, theirs: f64, pings: (f64, f64)) -> Report {
+        let mk = |target: &str, kind: Kind, ops: f64| {
+            let mut r = rb_row(target, kind, ops, 10_000, Driver::Memtier);
+            r.op = op;
+            r.pipeline = pipeline;
+            r
+        };
+        let mut r = report(vec![
+            mk("yo", Kind::Yo, ours),
+            mk("redis", Kind::Redis, theirs),
+        ]);
+        r.plan.cases = vec![
+            Case {
+                op: Op::Ping,
+                driver: Driver::Memtier,
+                pipeline,
+                requests: N as u64,
+            },
+            Case {
+                op,
+                driver: Driver::Memtier,
+                pipeline,
+                requests: N as u64,
+            },
+        ];
+        for (target, kind, ops) in [("yo", Kind::Yo, pings.0), ("redis", Kind::Redis, pings.1)] {
+            let mut p = rb_row(target, kind, ops, 10_000, Driver::Memtier);
+            p.op = Op::Ping;
+            p.pipeline = pipeline;
+            r.rows.push(p);
+        }
+        r
+    }
+
+    /// A command that costs more than a round trip is not held to the ceiling.
+    ///
+    /// These are the SINTER numbers from the gate box on 2026-09-01, over two
+    /// one thousand member fixtures. Sixteen microseconds a call against a five
+    /// microsecond round trip: the transport is a fifth of it and the engine is
+    /// the rest, so a ten times win is arithmetically available and the ceiling
+    /// is not the question. The old rule scored this row a fail at two percent
+    /// of the ceiling while it was beating Redis by 1.89x, which is a bar no
+    /// set intersection could ever reach and therefore not a measurement of
+    /// anything.
+    #[test]
+    fn a_command_slower_than_a_round_trip_is_scored_on_the_work() {
+        let r = paired(Op::Sinter, 1, 46_288.0, 24_438.0, (195_408.0, 179_724.0));
+        let v = &r.verdicts()[0];
+        let Bar::Work(ratio) = v.bar() else {
+            panic!(
+                "SINTER at sixteen microseconds is not transport bound: {:?}",
+                v.bar()
+            );
+        };
+        // 1e9/24438 - 1e9/179724 over 1e9/46288 - 1e9/195408.
+        assert!((ratio - 2.14).abs() < 0.05, "{ratio}");
+        assert!(!v.passes(), "2.14x is a real number and it is not ten");
+        assert_eq!(v.verdict(), "fail");
+    }
+
+    /// A command that costs less than a round trip still is.
+    ///
+    /// GET at pipeline 16 off the same run. Eighty one nanoseconds of engine
+    /// against a three hundred and fifty two nanosecond round trip, so even a
+    /// free GET would only be 1.30x and the ratio bar is the unreachable one
+    /// here. This is the case the ceiling was introduced for and it has to keep
+    /// working.
+    #[test]
+    fn a_command_faster_than_a_round_trip_is_scored_on_the_ceiling() {
+        let r = paired(
+            Op::Get,
+            16,
+            2_308_485.0,
+            2_041_848.0,
+            (2_839_125.0, 2_148_444.0),
+        );
+        let v = &r.verdicts()[0];
+        let Bar::Ceiling(c) = v.bar() else {
+            panic!(
+                "GET at eighty one nanoseconds is transport bound: {:?}",
+                v.bar()
+            );
+        };
+        assert!((c - 2_839_125.0).abs() < 1.0);
+        // Eighty one percent of the ceiling, which is a fail, and the work
+        // column is what says it missed on the engine rather than the socket.
+        assert!(!v.passes());
+        assert!((v.share().unwrap() - 0.813).abs() < 0.01);
     }
 
     /// A row that came out faster than the PING it would be measured against
