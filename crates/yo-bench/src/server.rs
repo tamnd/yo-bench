@@ -12,10 +12,14 @@ use std::time::{Duration, Instant};
 use crate::plan::{Kind, Plan, Target};
 
 /// A running server under test.
+#[derive(Debug)]
 pub struct Server {
     child: Child,
     kind: Kind,
     port: u16,
+    /// Where this server's output went, so a failure can quote it rather than
+    /// tell you to go looking.
+    log: std::path::PathBuf,
     /// Highest resident set the kernel saw, in kibibytes. Zero where the
     /// platform will not say.
     peak_kb: u64,
@@ -23,7 +27,34 @@ pub struct Server {
 
 impl Server {
     /// Start the target and wait until it answers.
+    ///
+    /// The port is checked before the spawn and after the stop, and the child is
+    /// watched while we wait for it. All three are the same bug seen from
+    /// different ends, and it is worth saying what it was because it cost a
+    /// whole gate run and produced numbers that looked fine.
+    ///
+    /// A server left over from an earlier run was still holding the port. Every
+    /// `start` after that spawned a child that died on "Address already in use",
+    /// and `wait_ready` then pinged the port, got `+PONG` from the leftover, and
+    /// said the server was up. So the harness restarted the server between every
+    /// case, as its own doc comment promises, and none of those restarts did
+    /// anything: one process served the entire plan and every case inherited the
+    /// keyspace the case before it had built. The run died nine cases in, on
+    /// `INCR` against keys that the `SET` case had filled with random strings,
+    /// and the eight rows before it were measured against a server in a state
+    /// nobody had asked for.
     pub fn start(target: &Target, plan: &Plan, dir: &std::path::Path) -> io::Result<Server> {
+        // Nothing may be on the port before we start. One server runs at a time
+        // here, so an answer now is a leftover, and carrying on would measure it
+        // instead of the binary this call names.
+        if ping_port(plan.port).is_ok() {
+            return Err(io::Error::other(format!(
+                "something is already answering on port {}, so {} was not started. \
+                 It is a server left over from an earlier run. Stop it and try again.",
+                plan.port, target.name
+            )));
+        }
+
         let mut cmd = match &plan.server_cpus {
             Some(cpus) => {
                 let mut c = Command::new("taskset");
@@ -83,35 +114,66 @@ impl Server {
             let _ = std::fs::remove_file(path);
         }
 
-        let log = std::fs::File::create(dir.join(format!("{}.log", target.name)))?;
+        let path = dir.join(format!("{}.log", target.name));
+        let log = std::fs::File::create(&path)?;
         let errlog = log.try_clone()?;
         let child = cmd
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(errlog))
             .spawn()?;
 
-        let server = Server {
+        let mut server = Server {
             child,
             kind: target.kind,
             port: plan.port,
+            log: path,
             peak_kb: 0,
         };
         server.wait_ready()?;
         Ok(server)
     }
 
-    /// Poll the port with an inline PING until it answers or we give up.
-    fn wait_ready(&self) -> io::Result<()> {
+    /// Poll the port with an inline PING until our own child answers it.
+    ///
+    /// The child is checked first on every turn of the loop, because a server
+    /// that could not bind is gone within milliseconds and a ping that succeeds
+    /// after that came from somebody else. Answering the port is not the same
+    /// question as being the process we started, and this is where those two
+    /// were run together.
+    fn wait_ready(&mut self) -> io::Result<()> {
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut last: Option<io::Error> = None;
         while Instant::now() < deadline {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Err(io::Error::other(format!(
+                    "the server exited with {status} before it answered. Its output was: {}",
+                    self.log_tail()
+                )));
+            }
             match self.ping() {
                 Ok(()) => return Ok(()),
                 Err(e) => last = Some(e),
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        Err(last.unwrap_or_else(|| io::Error::other("server never came up")))
+        Err(io::Error::other(format!(
+            "the server never came up: {}. Its output was: {}",
+            last.map_or_else(|| "no reason given".to_string(), |e| e.to_string()),
+            self.log_tail()
+        )))
+    }
+
+    /// The last few lines the server wrote, on one line, for an error message.
+    fn log_tail(&self) -> String {
+        let Ok(text) = std::fs::read_to_string(&self.log) else {
+            return format!("nothing readable at {}", self.log.display());
+        };
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        if lines.is_empty() {
+            return "nothing at all".to_string();
+        }
+        let from = lines.len().saturating_sub(5);
+        lines[from..].join(" / ")
     }
 
     /// One inline PING over a fresh connection.
@@ -121,25 +183,7 @@ impl Server {
     /// process that has bound the port but not started reading yet will not
     /// answer it.
     fn ping(&self) -> io::Result<()> {
-        let addr = format!("127.0.0.1:{}", self.port);
-        let mut sock = TcpStream::connect(&addr)?;
-        sock.set_read_timeout(Some(Duration::from_millis(500)))?;
-        sock.write_all(b"PING\r\n")?;
-        let mut buf = [0u8; 7];
-        let mut at = 0;
-        while at < buf.len() {
-            let n = sock.read(&mut buf[at..])?;
-            if n == 0 {
-                break;
-            }
-            at += n;
-        }
-        let _ = sock.shutdown(Shutdown::Both);
-        if buf.starts_with(b"+PONG") {
-            Ok(())
-        } else {
-            Err(io::Error::other(format!("PING answered {:?}", &buf[..at])))
-        }
+        ping_port(self.port)
     }
 
     /// Send one inline command and throw the answer away.
@@ -237,8 +281,27 @@ impl Server {
         hwm.max(sampled)
     }
 
-    /// Ask it to stop, then make sure it did.
+    /// Ask it to stop, then make sure it did, then make sure the port is free.
+    ///
+    /// The second half is the other end of the check in [`Server::start`]. If
+    /// something is still answering after our child is gone, then either it was
+    /// never our child answering or we have leaked one, and both of those are
+    /// worth a line on the terminal at the moment they happen rather than a
+    /// confusing failure in the next case.
     pub fn stop(mut self) {
+        let port = self.port;
+        self.stop_child();
+        // A moment for the socket to come out of the accept queue, then look.
+        std::thread::sleep(Duration::from_millis(50));
+        if ping_port(port).is_ok() {
+            eprintln!(
+                "warning: port {port} is still answering after the server was stopped. \
+                 There is another server on it and the rows after this one measure that one."
+            );
+        }
+    }
+
+    fn stop_child(&mut self) {
         // SHUTDOWN NOSAVE is the polite way and the one that leaves no file
         // behind. We do not implement it yet, and asking a server that does not
         // know the command to shut down means waiting out the timeout for
@@ -259,6 +322,33 @@ impl Server {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// One inline PING to a port, whoever is on the other end of it.
+///
+/// A free function rather than a method because [`Server::start`] asks the
+/// question before it has a server to ask it about, and that is the whole point:
+/// the answer says only that something is there, not that it is ours.
+fn ping_port(port: u16) -> io::Result<()> {
+    let addr = format!("127.0.0.1:{port}");
+    let mut sock = TcpStream::connect(&addr)?;
+    sock.set_read_timeout(Some(Duration::from_millis(500)))?;
+    sock.write_all(b"PING\r\n")?;
+    let mut buf = [0u8; 7];
+    let mut at = 0;
+    while at < buf.len() {
+        let n = sock.read(&mut buf[at..])?;
+        if n == 0 {
+            break;
+        }
+        at += n;
+    }
+    let _ = sock.shutdown(Shutdown::Both);
+    if buf.starts_with(b"+PONG") {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("PING answered {:?}", &buf[..at])))
     }
 }
 
@@ -306,5 +396,100 @@ pub fn version_of(bin: &str) -> String {
             }
         }
         Err(_) => "unknown".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::{Driver, Op};
+
+    /// A listener that answers `+PONG` and nothing else, standing in for a
+    /// server left over from an earlier run.
+    fn squatter() -> (u16, std::sync::mpsc::Sender<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let port = listener.local_addr().expect("bound").port();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("the listener takes nonblocking");
+            while rx.try_recv().is_err() {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        let mut buf = [0u8; 64];
+                        let _ = sock.set_read_timeout(Some(Duration::from_millis(200)));
+                        let _ = sock.read(&mut buf);
+                        let _ = sock.write_all(b"+PONG\r\n");
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        });
+        (port, tx)
+    }
+
+    fn plan_on(port: u16) -> Plan {
+        let mut plan = Plan::gate(Vec::new(), "redis-benchmark".into(), "memtier".into());
+        plan.port = port;
+        plan.cases = vec![crate::plan::Case {
+            op: Op::Ping,
+            driver: Driver::Memtier,
+            pipeline: 1,
+            requests: 1,
+        }];
+        plan
+    }
+
+    fn target(bin: &str) -> Target {
+        Target {
+            name: "yo".into(),
+            kind: Kind::Yo,
+            bin: bin.into(),
+            version: "test".into(),
+            io_threads: 1,
+        }
+    }
+
+    /// The bug that cost a gate run, from the front. Starting onto a port that
+    /// already answers has to be an error, because the alternative is measuring
+    /// whatever is on it.
+    #[test]
+    fn a_server_already_on_the_port_is_refused() {
+        let (port, stop) = squatter();
+        let dir = std::env::temp_dir();
+        // The binary does not exist and does not need to. Refusing happens
+        // before the spawn, and a name that could not run is the clearest way
+        // to say the spawn never happened.
+        let err = Server::start(&target("no-such-server"), &plan_on(port), &dir)
+            .expect_err("starting onto a held port has to fail");
+        let msg = err.to_string();
+        assert!(msg.contains("already answering"), "{msg}");
+        let _ = stop.send(());
+    }
+
+    /// And from the back. A binary that exits without binding must be reported
+    /// as having exited, rather than waited out for twenty seconds or, worse,
+    /// declared up because something else answered.
+    #[test]
+    fn a_server_that_exits_immediately_is_reported() {
+        // A free port with nothing on it: bound to find the number, then
+        // dropped. Racy in principle, but nothing else in this test binary
+        // binds and the window is microseconds.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("a free port")
+            .local_addr()
+            .expect("bound")
+            .port();
+        let dir = std::env::temp_dir();
+        let started = Instant::now();
+        let err = Server::start(&target("/usr/bin/false"), &plan_on(port), &dir)
+            .expect_err("a server that exits cannot be ready");
+        let msg = err.to_string();
+        assert!(msg.contains("exited with"), "{msg}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "it waited out the readiness timeout instead of noticing the child was gone"
+        );
     }
 }
