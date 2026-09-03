@@ -11,7 +11,7 @@
 use std::io;
 use std::process::Command;
 
-use crate::plan::{Driver, Fixture, Op, Plan};
+use crate::plan::{Driver, Fixture, Op, Plan, Shape};
 
 /// What one measured run produced.
 #[derive(Debug, Clone)]
@@ -148,7 +148,15 @@ pub fn build(plan: &Plan, fx: &Fixture, quiet: bool) -> io::Result<()> {
 }
 
 fn fixture_args(plan: &Plan, fx: &Fixture) -> (String, Vec<String>) {
-    let requests = fx.members.saturating_mul(5).max(100_000);
+    // Five draws a member for a set, because a draw can miss what a walk cannot
+    // and the doc on `Fixture` works out what that costs. One append an entry
+    // for a stream, because an append never misses: it does not care what was
+    // appended before it and two of them writing the same `__key__` are still
+    // two entries.
+    let requests = match fx.shape {
+        Shape::Set => fx.members.saturating_mul(5).max(100_000),
+        Shape::Stream => fx.members,
+    };
     let per_thread = (plan.clients / plan.threads).max(1);
     let conns = per_thread * plan.threads;
     let per_conn = (requests / u64::from(conns)).max(1);
@@ -168,7 +176,14 @@ fn fixture_args(plan: &Plan, fx: &Fixture) -> (String, Vec<String>) {
         format!("--key-maximum={}", fx.to()),
         "--hide-histogram".into(),
         "--distinct-client-seed".into(),
-        format!("--command=SADD {} __key__", fx.key),
+        match fx.shape {
+            Shape::Set => format!("--command=SADD {} __key__", fx.key),
+            // A star for the id, so the ids are the ones a real producer gets
+            // and the fill can come off every connection at once. Nothing reads
+            // the field, and it is `__key__` rather than a literal so that both
+            // shapes are the same invocation with the same key range.
+            Shape::Stream => format!("--command=XADD {} * f __key__", fx.key),
+        },
         "--command-key-pattern=R".into(),
     ]);
     (plan.memtier.clone(), args)
@@ -290,6 +305,16 @@ fn memtier_args(op: Op, plan: &Plan, pipeline: u32, requests: u64) -> (String, V
         // The fixture rows name their keys literally and take no argument out
         // of the keyspace, so like PING they get no key pattern. The keys have
         // to be the ones `Op::fixtures` builds or the row measures a miss.
+        // The same command `redis-benchmark -t xadd` sends, down to the star
+        // and the uncapped stream, so the two generators are measuring one
+        // thing. The field value comes out of the keyspace the way the set
+        // member does.
+        Op::Xadd => {
+            args.push("--command=XADD stream:add * f __key__".into());
+            args.push("--command-key-pattern=R".into());
+        }
+        Op::Xlen => args.push("--command=XLEN stream:read".into()),
+        Op::Xrange => args.push("--command=XRANGE stream:read - + COUNT 10".into()),
         Op::Spop => args.push("--command=SPOP set:pop".into()),
         Op::Srandmember => args.push("--command=SRANDMEMBER set:rand".into()),
         Op::Sinter => args.push("--command=SINTER set:a set:b".into()),
@@ -485,7 +510,14 @@ mod tests {
     #[test]
     fn every_fixture_row_asks_for_the_keys_its_fixtures_build() {
         let plan = Plan::smoke(Vec::new(), "redis-benchmark".into(), "memtier".into());
-        for op in [Op::Spop, Op::Srandmember, Op::Sinter, Op::Sunion] {
+        for op in [
+            Op::Spop,
+            Op::Srandmember,
+            Op::Sinter,
+            Op::Sunion,
+            Op::Xlen,
+            Op::Xrange,
+        ] {
             let (_, args) = memtier_args(op, &plan, 1, 1000);
             let command = args
                 .iter()
@@ -497,7 +529,12 @@ mod tests {
                 .skip(1)
                 .collect();
             let built: Vec<&str> = op.fixtures().iter().map(|f| f.key).collect();
-            assert_eq!(sent, built, "{op} reads {sent:?} and builds {built:?}");
+            // The keys come first and whatever follows them is the command's
+            // own options, which XRANGE has and the set rows do not.
+            assert!(
+                sent.len() >= built.len() && sent[..built.len()] == built[..],
+                "{op} reads {sent:?} and builds {built:?}"
+            );
         }
     }
 
@@ -507,6 +544,7 @@ mod tests {
     fn a_fixture_is_built_over_the_range_it_names() {
         let plan = Plan::smoke(Vec::new(), "redis-benchmark".into(), "memtier".into());
         let fx = Fixture {
+            shape: Shape::Set,
             key: "set:a",
             from: 501,
             members: 1_000,
@@ -527,6 +565,44 @@ mod tests {
         assert!(
             !args.iter().any(|a| a.starts_with("--key-pattern")),
             "{args:?}"
+        );
+    }
+
+    /// A stream fixture is filled with appends and one of them an entry.
+    ///
+    /// Five times the range is right for a set, where a draw can pick the same
+    /// member twice and the fifth draw is what gets the coverage to 99.3
+    /// percent. It is wrong for a stream, where it would build five million
+    /// entries and call them one million.
+    #[test]
+    fn a_stream_fixture_is_appended_to_once_an_entry() {
+        let plan = Plan::smoke(Vec::new(), "redis-benchmark".into(), "memtier".into());
+        let fx = Fixture {
+            shape: Shape::Stream,
+            key: "stream:read",
+            from: 1,
+            members: 1_000_000,
+        };
+        let args = fixture_args(&plan, &fx).1;
+        assert!(
+            args.iter()
+                .any(|a| a == "--command=XADD stream:read * f __key__"),
+            "{args:?}"
+        );
+        let conns = u64::from(plan.clients.max(1));
+        let per_conn: u64 = args
+            .iter()
+            .position(|a| a == "-n")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.parse().ok())
+            .expect("a request count");
+        // Within one command a connection of the nominal size, which is the
+        // integer division every row here does and not something this shape
+        // introduced.
+        let total = per_conn * conns;
+        assert!(
+            total <= 1_000_000 && 1_000_000 - total < conns,
+            "{total} entries against a million, {args:?}"
         );
     }
 
