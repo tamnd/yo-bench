@@ -74,6 +74,36 @@ pub enum Op {
     /// us and for the rivals equally, and a row that cut the sets down until
     /// the reply stopped mattering would be measuring something nobody runs.
     Sunion,
+    /// Append one entry to a stream.
+    ///
+    /// Uncapped, on purpose. `redis-benchmark -t xadd` sends `XADD mystream *
+    /// myfield __rand_int__` and never trims, so the stream grows for the whole
+    /// run, and a memtier row that capped it would be measuring a different
+    /// command from the one the other generator sends. Both servers get the
+    /// same treatment either way.
+    Xadd,
+    /// How many entries a stream holds.
+    ///
+    /// A counter and no walk at all, which makes it the stream family's version
+    /// of PING: whatever is left after the socket is the command table and the
+    /// reply, and every other stream row can be read as that plus its own work.
+    Xlen,
+    /// Ten entries off the front of a stream, which is the shape a reader
+    /// polling a log has.
+    Xrange,
+}
+
+/// What a [`Fixture`] is made of, which decides the command that fills it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// A set, filled with `SADD`.
+    Set,
+    /// A stream, filled with `XADD` and an auto id.
+    ///
+    /// The entries carry the same `__key__` the set members would, which nothing
+    /// reads. It is there so that both shapes are one memtier invocation with
+    /// one key range and the fill rate is the same for both.
+    Stream,
 }
 
 /// A collection that has to exist before a command can be measured against it.
@@ -87,11 +117,17 @@ pub enum Op {
 /// The fill is a random draw over the range rather than a walk across it,
 /// because a walk has to come off one connection to stay in order and a draw
 /// can use all of them. Coverage is 1 - e^(-n/k) and the builder sends five
-/// times the range, so a fixture is about 99.3 percent of its nominal size.
+/// times the range, so a set fixture is about 99.3 percent of its nominal size.
 /// Nothing here depends on the exact count and every server gets the same
-/// treatment, so the fraction of a percent is left alone.
+/// treatment, so the fraction of a percent is left alone. A stream fixture does
+/// not lose anything to draws, because an append does not care what was
+/// appended before it and two of them writing the same value are still two
+/// entries, so it is built one append an entry and comes out the size it says
+/// give or take the rounding of the count across the connections.
 #[derive(Debug, Clone, Copy)]
 pub struct Fixture {
+    /// What to build.
+    pub shape: Shape,
     /// The key to build.
     pub key: &'static str,
     /// The lowest member id.
@@ -132,13 +168,30 @@ const ALGEBRA_MEMBERS: u64 = 1_000;
 /// How many of those two sets are the same member.
 const ALGEBRA_SHARED: u64 = 500;
 
+/// Entries in the stream the read rows work on.
+///
+/// A million, which is ten thousand nodes at a hundred entries a node, so the
+/// binary search that finds the node has fourteen steps to take rather than
+/// none. A stream that fits in one node has no node lookup in it and would
+/// flatter both ends of the comparison equally and tell nobody anything.
+const STREAM_ENTRIES: u64 = 1_000_000;
+
+const STREAM_FIXTURE: [Fixture; 1] = [Fixture {
+    shape: Shape::Stream,
+    key: "stream:read",
+    from: 1,
+    members: STREAM_ENTRIES,
+}];
+
 const POP_FIXTURE: [Fixture; 1] = [Fixture {
+    shape: Shape::Set,
     key: "set:pop",
     from: 1,
     members: POP_MEMBERS,
 }];
 
 const RAND_FIXTURE: [Fixture; 1] = [Fixture {
+    shape: Shape::Set,
     key: "set:rand",
     from: 1,
     members: RAND_MEMBERS,
@@ -146,11 +199,13 @@ const RAND_FIXTURE: [Fixture; 1] = [Fixture {
 
 const ALGEBRA_FIXTURE: [Fixture; 2] = [
     Fixture {
+        shape: Shape::Set,
         key: "set:a",
         from: 1,
         members: ALGEBRA_MEMBERS,
     },
     Fixture {
+        shape: Shape::Set,
         key: "set:b",
         from: ALGEBRA_MEMBERS - ALGEBRA_SHARED + 1,
         members: ALGEBRA_MEMBERS,
@@ -170,6 +225,12 @@ impl Op {
             Op::Srandmember => "srandmember",
             Op::Sinter => "sinter",
             Op::Sunion => "sunion",
+            Op::Xadd => "xadd",
+            // Not tests `redis-benchmark` has. `Driver::can_run` keeps them off
+            // it, and these are here so the match stays exhaustive rather than
+            // so anything reads them.
+            Op::Xlen => "xlen",
+            Op::Xrange => "xrange",
             // The multi bulk form and not the inline one, because inline PING
             // is a different number of bytes on the wire and no real client
             // sends it.
@@ -187,6 +248,7 @@ impl Op {
             Op::Spop => &POP_FIXTURE,
             Op::Srandmember => &RAND_FIXTURE,
             Op::Sinter | Op::Sunion => &ALGEBRA_FIXTURE,
+            Op::Xlen | Op::Xrange => &STREAM_FIXTURE,
             _ => &[],
         }
     }
@@ -228,6 +290,9 @@ impl fmt::Display for Op {
             Op::Srandmember => "SRANDMEMBER",
             Op::Sinter => "SINTER",
             Op::Sunion => "SUNION",
+            Op::Xadd => "XADD",
+            Op::Xlen => "XLEN",
+            Op::Xrange => "XRANGE",
             Op::Ping => "PING",
         })
     }
@@ -437,6 +502,9 @@ impl Plan {
                 Op::Srandmember,
                 Op::Sinter,
                 Op::Sunion,
+                Op::Xadd,
+                Op::Xlen,
+                Op::Xrange,
             ] {
                 for driver in [Driver::RedisBenchmark, Driver::Memtier] {
                     if driver.can_run(op) {
