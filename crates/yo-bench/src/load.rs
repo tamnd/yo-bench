@@ -11,7 +11,7 @@
 use std::io;
 use std::process::Command;
 
-use crate::plan::{Driver, Fixture, Op, Plan, Shape};
+use crate::plan::{DELIVER_COUNT, Driver, Fixture, Op, Plan, Shape};
 
 /// What one measured run produced.
 #[derive(Debug, Clone)]
@@ -139,34 +139,151 @@ pub fn preload(driver: Driver, plan: &Plan, quiet: bool) -> io::Result<()> {
 /// floor so that the small algebra sets, where five times a thousand is five
 /// thousand requests and takes no time at all, come out complete rather than
 /// approximately complete.
+///
+/// A set or a plain stream is one invocation. The two consumer group shapes are
+/// three and four, run in order, because a group cannot be created before the
+/// stream it names exists and an entry cannot be handed out before the group is
+/// there to hand it out.
 pub fn build(plan: &Plan, fx: &Fixture, quiet: bool) -> io::Result<()> {
     if !quiet {
         eprintln!("    building {} with {} members", fx.key, fx.members);
     }
-    let (prog, args) = fixture_args(plan, fx);
-    exec(&prog, &args, plan, quiet).map(|_| ())
+    for (prog, args) in fixture_steps(plan, fx) {
+        exec(&prog, &args, plan, quiet)?;
+    }
+    Ok(())
 }
 
-fn fixture_args(plan: &Plan, fx: &Fixture) -> (String, Vec<String>) {
+/// One generator invocation in a fixture build.
+struct Step {
+    /// How many commands in total, before it is divided across connections.
+    requests: u64,
+    /// Whether it can come off every connection at once.
+    ///
+    /// A random draw and an auto id append can. An append that names its own id
+    /// cannot, because the second connection to get ahead writes an id the
+    /// first one can no longer follow and every append behind it is rejected.
+    parallel: bool,
+    /// The command, spelled the way memtier takes it.
+    command: String,
+    /// The pattern the key placeholder is drawn with, or None for a command
+    /// with no placeholder in it.
+    ///
+    /// It has to be None rather than a default, because memtier answers a key
+    /// pattern on a command with no key with a warning and answers a missing one
+    /// on a command with a key by sending the same key every time.
+    pattern: Option<&'static str>,
+    /// Whether the placeholder expands to the bare number.
+    ///
+    /// Off everywhere except the two steps that deal in stream ids, where the
+    /// number has to come out as `41` so that an id can be written `41-0`. The
+    /// default prefix would make that `memtier-41-0`, which is not an id.
+    bare: bool,
+}
+
+/// What building this fixture takes, in the order it has to happen.
+fn plan_steps(fx: &Fixture) -> Vec<Step> {
     // Five draws a member for a set, because a draw can miss what a walk cannot
     // and the doc on `Fixture` works out what that costs. One append an entry
     // for a stream, because an append never misses: it does not care what was
     // appended before it and two of them writing the same `__key__` are still
     // two entries.
-    let requests = match fx.shape {
-        Shape::Set => fx.members.saturating_mul(5).max(100_000),
-        Shape::Stream => fx.members,
+    let sadd = Step {
+        requests: fx.members.saturating_mul(5).max(100_000),
+        parallel: true,
+        command: format!("SADD {} __key__", fx.key),
+        pattern: Some("R"),
+        bare: false,
     };
-    let per_thread = (plan.clients / plan.threads).max(1);
-    let conns = per_thread * plan.threads;
-    let per_conn = (requests / u64::from(conns)).max(1);
+    // A star for the id, so the ids are the ones a real producer gets and the
+    // fill can come off every connection at once. Nothing reads the field, and
+    // it is `__key__` rather than a literal so that this is the same invocation
+    // with the same key range as the set fill.
+    let xadd = Step {
+        requests: fx.members,
+        parallel: true,
+        command: format!("XADD {} * f __key__", fx.key),
+        pattern: Some("R"),
+        bare: false,
+    };
+    // The group starts at zero, so everything already in the stream counts as
+    // undelivered and a `>` read has somewhere to go.
+    let group = Step {
+        requests: 1,
+        parallel: false,
+        command: format!("XGROUP CREATE {} g 0", fx.key),
+        pattern: None,
+        bare: false,
+    };
+    // The two group shapes get rebuilt between passes against a server that is
+    // still holding the last build, and a stream cannot be appended to twice
+    // over the same ids. So they start by throwing the old one away, which also
+    // takes the group and its pending list with it.
+    let del = Step {
+        requests: 1,
+        parallel: false,
+        command: format!("DEL {}", fx.key),
+        pattern: None,
+        bare: false,
+    };
+    match fx.shape {
+        Shape::Set => vec![sadd],
+        Shape::Stream => vec![xadd],
+        Shape::Group => vec![del, xadd, group],
+        Shape::Pending => vec![
+            del,
+            // Sequential and off one connection, so the ids come out in order
+            // and are exactly the numbers in the range. The measured run names
+            // them back, which is the whole reason this shape exists.
+            Step {
+                requests: fx.members,
+                parallel: false,
+                command: format!("XADD {} __key__-0 f v", fx.key),
+                pattern: Some("S"),
+                bare: true,
+            },
+            group,
+            // Hand every entry out, so the group's pending list holds the whole
+            // range and every ack in the measured run is a hit. A tenth more
+            // calls than the arithmetic needs, because the count is divided
+            // across the connections and the remainder would otherwise leave a
+            // tail of the stream undelivered.
+            Step {
+                requests: fx.members.div_ceil(DELIVER_COUNT) * 11 / 10,
+                parallel: true,
+                command: format!(
+                    "XREADGROUP GROUP g fill COUNT {DELIVER_COUNT} STREAMS {} >",
+                    fx.key
+                ),
+                pattern: None,
+                bare: false,
+            },
+        ],
+    }
+}
+
+fn fixture_steps(plan: &Plan, fx: &Fixture) -> Vec<(String, Vec<String>)> {
+    plan_steps(fx)
+        .into_iter()
+        .map(|step| (plan.memtier.clone(), step_args(plan, fx, &step)))
+        .collect()
+}
+
+fn step_args(plan: &Plan, fx: &Fixture, step: &Step) -> Vec<String> {
+    let (threads, per_thread) = if step.parallel {
+        let per_thread = (plan.clients / plan.threads).max(1);
+        (plan.threads, per_thread)
+    } else {
+        (1, 1)
+    };
+    let per_conn = (step.requests / u64::from(threads * per_thread)).max(1);
 
     let mut args = memtier_where(plan);
     args.extend([
         "-P".into(),
         "redis".into(),
         "-t".into(),
-        plan.threads.to_string(),
+        threads.to_string(),
         "-c".into(),
         per_thread.to_string(),
         "-n".into(),
@@ -176,17 +293,15 @@ fn fixture_args(plan: &Plan, fx: &Fixture) -> (String, Vec<String>) {
         format!("--key-maximum={}", fx.to()),
         "--hide-histogram".into(),
         "--distinct-client-seed".into(),
-        match fx.shape {
-            Shape::Set => format!("--command=SADD {} __key__", fx.key),
-            // A star for the id, so the ids are the ones a real producer gets
-            // and the fill can come off every connection at once. Nothing reads
-            // the field, and it is `__key__` rather than a literal so that both
-            // shapes are the same invocation with the same key range.
-            Shape::Stream => format!("--command=XADD {} * f __key__", fx.key),
-        },
-        "--command-key-pattern=R".into(),
+        format!("--command={}", step.command),
     ]);
-    (plan.memtier.clone(), args)
+    if let Some(p) = step.pattern {
+        args.push(format!("--command-key-pattern={p}"));
+    }
+    if step.bare {
+        args.push("--key-prefix=".into());
+    }
+    args
 }
 
 /// Where memtier should connect, and never both ways at once.
@@ -254,6 +369,10 @@ fn memtier_args(op: Op, plan: &Plan, pipeline: u32, requests: u64) -> (String, V
     let conns = per_thread * plan.threads;
     let per_conn = (requests / u64::from(conns)).max(1);
 
+    // The plan's keyspace, unless the op draws its placeholder out of a fixture
+    // it built, in which case the fixture's range is the only one that can hit.
+    let (kmin, kmax) = op.key_range().unwrap_or((1, plan.keyspace));
+
     let mut args = memtier_where(plan);
     args.extend([
         "-P".into(),
@@ -267,8 +386,8 @@ fn memtier_args(op: Op, plan: &Plan, pipeline: u32, requests: u64) -> (String, V
         format!("--pipeline={pipeline}"),
         "-d".into(),
         plan.value_bytes.to_string(),
-        "--key-minimum=1".into(),
-        format!("--key-maximum={}", plan.keyspace),
+        format!("--key-minimum={kmin}"),
+        format!("--key-maximum={kmax}"),
         "--hide-histogram".into(),
         "--distinct-client-seed".into(),
     ]);
@@ -315,6 +434,25 @@ fn memtier_args(op: Op, plan: &Plan, pipeline: u32, requests: u64) -> (String, V
         }
         Op::Xlen => args.push("--command=XLEN stream:read".into()),
         Op::Xrange => args.push("--command=XRANGE stream:read - + COUNT 10".into()),
+        // One entry a call, which is what a worker following the tail asks for
+        // and is the form with the group bookkeeping in it. Every connection is
+        // the same consumer, which is what a pool of workers sharing a name
+        // looks like and is not what decides the cost: `>` hands each entry out
+        // once whoever asks.
+        Op::Xreadgroup => {
+            args.push("--command=XREADGROUP GROUP g c COUNT 1 STREAMS stream:group >".into())
+        }
+        // The only row that names an id, and the reason the pending fixture
+        // spells its ids out. `P` gives each connection its own stretch of the
+        // range, so no two of them ack the same entry and every ack is a hit
+        // rather than a lookup and a miss, which is faster than the delete this
+        // row is about. The empty prefix is what makes `__key__` the bare number
+        // an id can be built out of.
+        Op::Xack => {
+            args.push("--command=XACK stream:ack g __key__-0".into());
+            args.push("--command-key-pattern=P".into());
+            args.push("--key-prefix=".into());
+        }
         Op::Spop => args.push("--command=SPOP set:pop".into()),
         Op::Srandmember => args.push("--command=SRANDMEMBER set:rand".into()),
         Op::Sinter => args.push("--command=SINTER set:a set:b".into()),
@@ -517,6 +655,8 @@ mod tests {
             Op::Sunion,
             Op::Xlen,
             Op::Xrange,
+            Op::Xreadgroup,
+            Op::Xack,
         ] {
             let (_, args) = memtier_args(op, &plan, 1, 1000);
             let command = args
@@ -529,12 +669,115 @@ mod tests {
                 .skip(1)
                 .collect();
             let built: Vec<&str> = op.fixtures().iter().map(|f| f.key).collect();
-            // The keys come first and whatever follows them is the command's
-            // own options, which XRANGE has and the set rows do not.
-            assert!(
-                sent.len() >= built.len() && sent[..built.len()] == built[..],
-                "{op} reads {sent:?} and builds {built:?}"
-            );
+            // Somewhere in the command rather than at the front of it. The set
+            // rows put their keys first, XRANGE follows its key with a range and
+            // a count, and XREADGROUP puts its key most of the way along after
+            // the group and the consumer.
+            for key in &built {
+                assert!(
+                    sent.contains(key),
+                    "{op} reads {sent:?} and builds {built:?}"
+                );
+            }
+        }
+    }
+
+    /// XACK is the one row whose placeholder is not a key but a number inside a
+    /// stream id, and the ids it can hit are exactly the ones its fixture
+    /// appended. Draw it out of the plan's keyspace instead and the run acks
+    /// entries nobody is holding, which is a miss, which is faster than the
+    /// delete the row is meant to be measuring.
+    #[test]
+    fn the_ack_row_draws_its_ids_out_of_the_range_its_fixture_appended() {
+        let plan = Plan::smoke(Vec::new(), "redis-benchmark".into(), "memtier".into());
+        let fx = Op::Xack.fixtures()[0];
+        let (_, args) = memtier_args(Op::Xack, &plan, 1, 1000);
+        assert!(
+            args.iter()
+                .any(|a| a == &format!("--key-minimum={}", fx.from)),
+            "{args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == &format!("--key-maximum={}", fx.to())),
+            "{args:?}"
+        );
+        // The bare number and not `memtier-41`, or the id is not an id.
+        assert!(args.iter().any(|a| a == "--key-prefix="), "{args:?}");
+        // Each connection its own stretch of the range, so two of them never
+        // ack the same entry.
+        assert!(
+            args.iter().any(|a| a == "--command-key-pattern=P"),
+            "{args:?}"
+        );
+    }
+
+    /// The pending fixture is four invocations and the order of them is the
+    /// whole thing: a group cannot be created on a stream that is not there, an
+    /// entry cannot be handed out before the group exists, and the appends have
+    /// to come off one connection because a second writer racing ahead leaves
+    /// every append behind it naming an id the stream has already passed.
+    #[test]
+    fn the_pending_fixture_appends_in_order_then_hands_everything_out() {
+        let fx = Op::Xack.fixtures()[0];
+        let steps = plan_steps(&fx);
+        let sent: Vec<&str> = steps.iter().map(|s| s.command.as_str()).collect();
+        assert_eq!(
+            sent,
+            vec![
+                "DEL stream:ack",
+                "XADD stream:ack __key__-0 f v",
+                "XGROUP CREATE stream:ack g 0",
+                "XREADGROUP GROUP g fill COUNT 100 STREAMS stream:ack >",
+            ]
+        );
+        assert!(
+            !steps[1].parallel,
+            "the explicit ids come off one connection"
+        );
+        assert!(steps[1].bare, "the id is built out of the bare number");
+        assert_eq!(steps[1].requests, fx.members);
+        // Enough calls to hand out everything that was appended, with room for
+        // the remainder the division across connections leaves behind.
+        assert!(
+            steps[3].requests * 100 >= fx.members,
+            "{} calls of 100 against {} entries",
+            steps[3].requests,
+            fx.members
+        );
+        assert!(steps[3].parallel);
+    }
+
+    /// A group read is only a group read while the group has something
+    /// undelivered in it, so the fixture creates the group at zero and hands
+    /// nothing out.
+    #[test]
+    fn the_group_fixture_leaves_every_entry_undelivered() {
+        let fx = Op::Xreadgroup.fixtures()[0];
+        let steps = plan_steps(&fx);
+        let sent: Vec<&str> = steps.iter().map(|s| s.command.as_str()).collect();
+        assert_eq!(
+            sent,
+            vec![
+                "DEL stream:group",
+                "XADD stream:group * f __key__",
+                "XGROUP CREATE stream:group g 0",
+            ]
+        );
+    }
+
+    /// Both group shapes get rebuilt between passes against a server that still
+    /// holds the last build, and appending the same ids to a stream that already
+    /// has them is rejected entry by entry. So the rebuild starts by throwing
+    /// the old one away.
+    #[test]
+    fn a_rebuilt_stream_fixture_starts_from_nothing() {
+        for op in [Op::Xreadgroup, Op::Xack] {
+            assert!(op.drains(), "{op} is rebuilt between passes");
+            for fx in op.fixtures() {
+                let first = &plan_steps(fx)[0];
+                assert_eq!(first.command, format!("DEL {}", fx.key));
+            }
         }
     }
 
@@ -549,7 +792,7 @@ mod tests {
             from: 501,
             members: 1_000,
         };
-        let args = fixture_args(&plan, &fx).1;
+        let args = fixture_steps(&plan, &fx).remove(0).1;
         assert!(args.iter().any(|a| a == "--key-minimum=501"), "{args:?}");
         assert!(args.iter().any(|a| a == "--key-maximum=1500"), "{args:?}");
         assert!(
@@ -583,7 +826,7 @@ mod tests {
             from: 1,
             members: 1_000_000,
         };
-        let args = fixture_args(&plan, &fx).1;
+        let args = fixture_steps(&plan, &fx).remove(0).1;
         assert!(
             args.iter()
                 .any(|a| a == "--command=XADD stream:read * f __key__"),
@@ -612,7 +855,7 @@ mod tests {
     fn a_fixture_follows_the_run_onto_the_socket_file() {
         let mut plan = Plan::smoke(Vec::new(), "redis-benchmark".into(), "memtier".into());
         plan.socket = Some("/tmp/yobench.sock".into());
-        let args = fixture_args(&plan, &Op::Spop.fixtures()[0]).1;
+        let args = fixture_steps(&plan, &Op::Spop.fixtures()[0]).remove(0).1;
         assert_eq!(window(&args, "-S"), Some("/tmp/yobench.sock"));
         assert!(!args.iter().any(|a| a == "-s" || a == "-p"), "{args:?}");
     }

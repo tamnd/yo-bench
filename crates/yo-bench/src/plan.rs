@@ -91,6 +91,22 @@ pub enum Op {
     /// Ten entries off the front of a stream, which is the shape a reader
     /// polling a log has.
     Xrange,
+    /// Take the next entry out of a consumer group.
+    ///
+    /// One entry a call and a `>` id, which is what a tail following worker
+    /// sends and is the only form that has the group bookkeeping in it. It
+    /// consumes what it reads twice over: the entry moves out of the undelivered
+    /// range and into the group's pending list, so neither half of the state it
+    /// ran against is there for the next pass.
+    Xreadgroup,
+    /// Acknowledge one entry a consumer group is holding.
+    ///
+    /// The hard one to set up, because an ack that names an id nobody is holding
+    /// is a lookup and a miss rather than the delete this row is about, and it
+    /// comes back faster than the real thing. The fixture appends ids the
+    /// generator can name, hands them all out, and then the run acks a slice of
+    /// them per connection so every ack hits.
+    Xack,
 }
 
 /// What a [`Fixture`] is made of, which decides the command that fills it.
@@ -104,6 +120,20 @@ pub enum Shape {
     /// reads. It is there so that both shapes are one memtier invocation with
     /// one key range and the fill rate is the same for both.
     Stream,
+    /// A stream with a consumer group on it and nothing handed out yet.
+    ///
+    /// The group is created at `0`, so every entry in the stream is waiting for
+    /// the first reader and a `>` read has somewhere to go.
+    Group,
+    /// A stream whose entries are all sitting in a consumer group's pending
+    /// list.
+    ///
+    /// Three steps rather than one, and the only shape where the ids matter. The
+    /// entries are appended with the ids the generator can name rather than with
+    /// a star, so the measured run can say which one it is acknowledging, and
+    /// that append has to come off one connection because a second writer
+    /// putting a lower id in is rejected rather than reordered.
+    Pending,
 }
 
 /// A collection that has to exist before a command can be measured against it.
@@ -183,6 +213,38 @@ const STREAM_FIXTURE: [Fixture; 1] = [Fixture {
     members: STREAM_ENTRIES,
 }];
 
+/// Entries waiting in the group XREADGROUP reads from, and in the group XACK
+/// acknowledges.
+///
+/// The same four million SPOP gets, for the same reason and with the same margin
+/// over the run: all three consume what they read, and a run that reaches the
+/// bottom stops measuring the command and starts measuring the empty reply.
+const GROUP_ENTRIES: u64 = 4_000_000;
+
+/// Commands in an XREADGROUP or an XACK run.
+const GROUP_RUN: u64 = 3_000_000;
+
+/// How many entries one call of the fixture's delivery step hands out.
+///
+/// A hundred, because that step is setup and nobody is timing it. The measured
+/// row asks for one at a time, which is the shape a worker has and is a
+/// different question from how fast a batch can be handed over.
+pub const DELIVER_COUNT: u64 = 100;
+
+const GROUP_FIXTURE: [Fixture; 1] = [Fixture {
+    shape: Shape::Group,
+    key: "stream:group",
+    from: 1,
+    members: GROUP_ENTRIES,
+}];
+
+const PENDING_FIXTURE: [Fixture; 1] = [Fixture {
+    shape: Shape::Pending,
+    key: "stream:ack",
+    from: 1,
+    members: GROUP_ENTRIES,
+}];
+
 const POP_FIXTURE: [Fixture; 1] = [Fixture {
     shape: Shape::Set,
     key: "set:pop",
@@ -231,6 +293,8 @@ impl Op {
             // so anything reads them.
             Op::Xlen => "xlen",
             Op::Xrange => "xrange",
+            Op::Xreadgroup => "xreadgroup",
+            Op::Xack => "xack",
             // The multi bulk form and not the inline one, because inline PING
             // is a different number of bytes on the wire and no real client
             // sends it.
@@ -249,19 +313,36 @@ impl Op {
             Op::Srandmember => &RAND_FIXTURE,
             Op::Sinter | Op::Sunion => &ALGEBRA_FIXTURE,
             Op::Xlen | Op::Xrange => &STREAM_FIXTURE,
+            Op::Xreadgroup => &GROUP_FIXTURE,
+            Op::Xack => &PENDING_FIXTURE,
             _ => &[],
         }
     }
 
     /// How many commands a run is, when the fixture and not the clock decides.
     ///
-    /// Only SPOP, and only because it consumes what it reads. Everything else
-    /// is calibrated by probing until the run lasts [`Plan::min_seconds`], and
-    /// probing a draining op would empty the set before the measured pass
-    /// started.
+    /// The three that consume what they read. Everything else is calibrated by
+    /// probing until the run lasts [`Plan::min_seconds`], and probing a draining
+    /// op would empty the set before the measured pass started.
     pub fn fixed_requests(self) -> Option<u64> {
         match self {
             Op::Spop => Some(POP_RUN),
+            Op::Xreadgroup | Op::Xack => Some(GROUP_RUN),
+            _ => None,
+        }
+    }
+
+    /// The range the key placeholder is drawn from, when a fixture and not the
+    /// plan's keyspace decides it.
+    ///
+    /// Only XACK, and its placeholder is not really a key: it is the number in
+    /// a stream id, and the only ids it can hit are the ones its fixture
+    /// appended. Drawn from the plan's keyspace instead it would run off the end
+    /// of the pending list a quarter of the way in and spend the rest of the row
+    /// measuring acks of entries nobody is holding.
+    pub fn key_range(self) -> Option<(u64, u64)> {
+        match self {
+            Op::Xack => Some((PENDING_FIXTURE[0].from, PENDING_FIXTURE[0].to())),
             _ => None,
         }
     }
@@ -274,7 +355,7 @@ impl Op {
     /// against the same server and is a better warmup than a tenth of the run
     /// would have been.
     pub fn drains(self) -> bool {
-        self == Op::Spop
+        matches!(self, Op::Spop | Op::Xreadgroup | Op::Xack)
     }
 }
 
@@ -293,6 +374,8 @@ impl fmt::Display for Op {
             Op::Xadd => "XADD",
             Op::Xlen => "XLEN",
             Op::Xrange => "XRANGE",
+            Op::Xreadgroup => "XREADGROUP",
+            Op::Xack => "XACK",
             Op::Ping => "PING",
         })
     }
@@ -469,7 +552,8 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// The gate plan: nine commands, two generators, two pipeline depths.
+    /// The gate plan: fifteen commands counting the PING ceiling, two
+    /// generators, two pipeline depths.
     ///
     /// The numbers are the ones the methodology fixes. 64 byte values because
     /// the default of 3 measures the protocol and nothing else. A keyspace of
@@ -505,6 +589,8 @@ impl Plan {
                 Op::Xadd,
                 Op::Xlen,
                 Op::Xrange,
+                Op::Xreadgroup,
+                Op::Xack,
             ] {
                 for driver in [Driver::RedisBenchmark, Driver::Memtier] {
                     if driver.can_run(op) {
@@ -612,17 +698,20 @@ mod tests {
         assert!(shared < a.members, "an overlap, not one set twice");
     }
 
-    /// The one invariant SPOP has. A run longer than the fixture reaches the
-    /// bottom partway through and spends the rest of itself measuring how fast
-    /// the server says the set is empty, which is faster than a pop and drags
-    /// the row upward.
+    /// The one invariant the draining rows have. A run longer than the fixture
+    /// reaches the bottom partway through and spends the rest of itself
+    /// measuring how fast the server says there is nothing left, which is faster
+    /// than the real command and drags the row upward.
     #[test]
-    fn a_pop_run_cannot_reach_the_bottom_of_its_fixture() {
-        let run = Op::Spop.fixed_requests().expect("SPOP has a fixed count");
-        let held: u64 = Op::Spop.fixtures().iter().map(|f| f.members).sum();
-        // Fixtures are filled by random draw and land about 99.3 percent full,
-        // so the margin has to be more than a rounding one.
-        assert!(run < held * 9 / 10, "{run} pops out of {held} members");
+    fn a_draining_run_cannot_reach_the_bottom_of_its_fixture() {
+        for op in [Op::Spop, Op::Xreadgroup, Op::Xack] {
+            assert!(op.drains(), "{op}");
+            let run = op.fixed_requests().unwrap_or_else(|| panic!("{op}"));
+            let held: u64 = op.fixtures().iter().map(|f| f.members).sum();
+            // Set fixtures are filled by random draw and land about 99.3 percent
+            // full, so the margin has to be more than a rounding one.
+            assert!(run < held * 9 / 10, "{op} runs {run} against {held}");
+        }
     }
 
     /// A generator gets a row when it can set the row up as well as send it.
