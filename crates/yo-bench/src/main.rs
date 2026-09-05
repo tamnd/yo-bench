@@ -21,7 +21,7 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use machine::Machine;
-use plan::{Kind, Plan, Target};
+use plan::{Driver, Kind, Plan, Target};
 use report::{Report, Row};
 use server::Server;
 
@@ -100,14 +100,27 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
 
     let rb = pick(&opts.prefix, "redis-benchmark")
         .ok_or("redis-benchmark is not under the prefix. Run suite/provision.sh")?;
-    let mt = pick(&opts.prefix, "memtier_benchmark")
-        .ok_or("memtier_benchmark is not under the prefix. Run suite/provision.sh")?;
+    // memtier is the harder one to get onto a box, because it wants autoreconf
+    // and a box without it can still run every redis-benchmark row. So a
+    // missing memtier drops the rows that need it and says so, rather than
+    // costing the whole run.
+    let mt = pick(&opts.prefix, "memtier_benchmark");
 
     let mut plan = match opts.plan_name.as_str() {
-        "gate" => Plan::gate(targets, rb, mt),
-        "smoke" => Plan::smoke(targets, rb, mt),
+        "gate" => Plan::gate(targets, rb, mt.clone().unwrap_or_default()),
+        "smoke" => Plan::smoke(targets, rb, mt.clone().unwrap_or_default()),
         other => return Err(format!("no such plan: {other}")),
     };
+
+    if mt.is_none() {
+        let before = plan.cases.len();
+        plan.cases.retain(|c| c.driver != Driver::Memtier);
+        let dropped = before - plan.cases.len();
+        if plan.cases.is_empty() {
+            return Err("memtier_benchmark is not under the prefix and every case needs it. Run suite/provision.sh".into());
+        }
+        eprintln!("memtier_benchmark is not here, dropping {dropped} of {before} cases");
+    }
 
     if let Some(v) = opts.requests {
         plan.requests = v;
